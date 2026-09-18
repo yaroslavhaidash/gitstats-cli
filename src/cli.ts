@@ -7,6 +7,7 @@
  *   gitstats sync             recount the last year and upload (idempotent)
  *   gitstats status           show what is linked and when it last ran
  *   gitstats add <path>       track a repo outside the scanned folders
+ *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
  *   gitstats emails add <e>   attribute commits made with another email to you
  *   gitstats unlink           remove the schedule and local config
  */
@@ -131,10 +132,6 @@ function weekStartUtc(d: Date): string {
   return s.toISOString().slice(0, 10);
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function countRepo(repo: string, emails: string[], since: string): RepoReport | null {
   const info = remoteInfo(repo);
   const localEmail = git(repo, "config", "user.email")?.trim();
@@ -142,8 +139,9 @@ function countRepo(repo: string, emails: string[], since: string): RepoReport | 
   if (all.length === 0) return null;
   const ref = defaultRef(repo);
   const out = git(
-    repo, "log", ref, "--no-merges", `--since=${since}`, "--numstat", "--date=iso-strict",
-    "--format=%x1e%H%x1f%aI", ...all.map((e) => `--author=${escapeRegex(e)}`),
+    // --fixed-strings: emails like 123+login@users.noreply.github.com would otherwise be read as regex.
+    repo, "log", ref, "--no-merges", "--fixed-strings", `--since=${since}`, "--numstat", "--date=iso-strict",
+    "--format=%x1e%H%x1f%aI", ...all.map((e) => `--author=${e}`),
   );
   if (out === null) return null;
   const weeks = new Map<string, Week>();
@@ -200,9 +198,14 @@ async function sync(c: Config, quiet = false): Promise<void> {
   const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
   const repos = findRepos(c.roots, c.repos);
   const reports: RepoReport[] = [];
+  const seen = new Set<string>();
   for (const r of repos) {
     const rep = countRepo(r, c.emails, since);
-    if (rep) reports.push(rep);
+    // Worktrees and extra clones share a remote; the first one wins, they see the same origin/HEAD anyway.
+    if (rep && !seen.has(rep.remoteHash)) {
+      seen.add(rep.remoteHash);
+      reports.push(rep);
+    }
   }
   const { status, body } = await post<{ repos: number; weeks: number }>(c.server, "/api/ingest", { machine: c.machine, repos: reports }, c.token);
   if (status !== 200 || !body) {
@@ -321,20 +324,20 @@ async function link(): Promise<void> {
   const ge = globalEmail();
   if (ge) emails.add(ge);
   if (done.githubId !== null) emails.add(`${done.githubId}+${done.login}@users.noreply.github.com`);
-  const rootArg = args.includes("--root") ? args[args.indexOf("--root") + 1] : undefined;
+  const roots = args.flatMap((a, i) => (a === "--root" && args[i + 1] ? [resolve(args[i + 1]!)] : []));
   const c: Config = {
     server,
     token: done.token,
     login: done.login,
     githubId: done.githubId,
     machine,
-    roots: [resolve(rootArg ?? HOME)],
+    roots: roots.length > 0 ? roots : [HOME],
     repos: [],
     emails: [...emails],
   };
   saveConfig(c);
   log(`  linked as ${done.login} · counting commits by: ${[...emails].join(", ") || "(no email found; run: gitstats emails add you@example.com)"}`);
-  log(`  scanning ${c.roots[0]} for git repos… (this first run can take a minute)`);
+  log(`  scanning ${c.roots.join(", ")} for git repos… (this first run can take a minute)`);
   await sync(c);
   const how = installSchedule();
   log(`\n  scheduled: ${how}`);
@@ -368,6 +371,19 @@ async function main(): Promise<void> {
       log(`tracking ${p}`);
       return sync(c);
     }
+    case "roots": {
+      const c = requireConfig();
+      const d = args[2];
+      if (args[1] === "add" && d) {
+        const p = resolve(d);
+        if (!c.roots.includes(p)) c.roots.push(p);
+        saveConfig(c);
+        log(`roots: ${c.roots.join(", ")}`);
+        return sync(c);
+      }
+      log(`roots: ${c.roots.join(", ")}`);
+      return;
+    }
     case "emails": {
       const c = requireConfig();
       const e = args[2];
@@ -386,7 +402,7 @@ async function main(): Promise<void> {
       log("unlinked; revoke this computer on the settings page too");
       return;
     default:
-      log("usage: gitstats <link|sync|status|add <path>|emails add <email>|unlink>");
+      log("usage: gitstats <link [--root <dir>]...|sync|status|add <path>|roots add <dir>|emails add <email>|unlink>");
   }
 }
 
