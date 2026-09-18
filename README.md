@@ -14,4 +14,4 @@ What leaves the machine, per repo: an HMAC-SHA256 of the normalised remote URL k
 
 You are trusting the operator: `npx github:…` runs the committed `dist/` from this repo. Read `src/cli.ts` (~400 lines) or watch the payload with a proxy.
 
-Commands: `sync` · `status` · `add <path>` · `roots add <dir>` · `emails add <email>` · `names on|off` · `unlink` (also revokes server-side). Config lives in `~/.gitstats/config.json` (mode 600).
+Commands: `sync` · `status` · `add <path>` · `roots add <dir>` · `emails add <email>` · `names on|off` · `update` · `unlink` (also revokes server-side). It keeps itself up to date: every sync checks npm at most once a day and installs a newer version before finishing, `sync --no-update` skips that. Config lives in `~/.gitstats/config.json` (mode 600).

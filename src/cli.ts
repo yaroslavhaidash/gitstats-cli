@@ -5,20 +5,21 @@
  *
  *   npx @yaroslavhaidash/gitstats-cli@latest link
  *                             pair this computer, scan for repos, sync, install a daily sync
- *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent; --no-fetch to skip)
+ *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent;
+ *                             --no-fetch skips the fetch, --no-update skips the daily version check)
  *   gitstats status           show what is linked and when it last ran
  *   gitstats add <path>       track a repo outside the scanned folders
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
  *   gitstats emails add <e>   attribute commits made with another email to you
  *   gitstats names on|off     also send repo names (off by default; your own page then labels private repos by hash)
  *   gitstats pause | resume   stop / restart the background sync without unlinking
- *   gitstats update           fetch the latest published version and replace the installed copy
+ *   gitstats update           fetch the latest published version now (sync does this on its own, once a day)
  *   gitstats unlink           revoke this computer and remove the schedule and local config
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { createInterface } from "node:readline/promises";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
 import { homedir, hostname, platform, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +32,9 @@ const CONFIG = join(DIR, "config.json");
 const SELF = join(DIR, "cli");
 const DAYS = 365;
 const PENDING_DAYS = 30;
+const SYNC_LOG = join(DIR, "sync.log");
+const UPDATE_EVERY_MS = 24 * 60 * 60 * 1000;
+const REGISTRY = `https://registry.npmjs.org/${PKG.replace("/", "%2F")}/latest`;
 const SKIP_DIRS = new Set(["node_modules", "Library", "Applications", ".Trash", "vendor", "target", "build", "dist", ".venv", "venv", "__pycache__", "Pods", "DerivedData", "go", ".cargo", ".rustup", ".npm", ".cache", ".local", "snap", "AppData"]);
 
 type Config = {
@@ -46,6 +50,8 @@ type Config = {
   repos: string[];
   emails: string[];
   lastSync?: { at: string; repos: number; weeks: number; error?: string };
+  /** When the registry was last asked for a newer version; the check runs at most once a day. */
+  lastUpdateCheck?: string;
 };
 
 type Week = { weekStart: string; additions: number; deletions: number; commits: number };
@@ -60,6 +66,17 @@ const cmd = args[0] ?? "help";
 
 function log(msg: string): void {
   console.log(msg);
+}
+
+/** Background runs already redirect their output here; a manual run appends directly so a failed
+ *  update check leaves the same trail either way. */
+function logFile(msg: string): void {
+  try {
+    mkdirSync(DIR, { recursive: true });
+    appendFileSync(SYNC_LOG, `${new Date().toISOString()} ${msg}\n`);
+  } catch {
+    /* the log is best effort; it must never break a sync */
+  }
 }
 
 function loadConfig(): Config | null {
@@ -319,7 +336,12 @@ function count(c: Config, since: string): { scanned: number; reports: Counted[] 
 
 async function upload(c: Config, reports: Counted[]): Promise<{ repos: number; weeks: number }> {
   const payload = reports.map(({ remoteHash, name, language, weeks, days, pending }) => ({ remoteHash, name, language, weeks, days, pending }));
-  const { status, body } = await post<{ repos: number; weeks: number }>(c.server, "/api/ingest", { repos: payload }, c.token);
+  const { status, body } = await post<{ repos: number; weeks: number; outdated?: boolean; minVersion?: string }>(
+    c.server,
+    "/api/ingest",
+    { cliVersion: runningVersion(), repos: payload },
+    c.token,
+  );
   if (status !== 200 || !body) {
     c.lastSync = { at: new Date().toISOString(), repos: 0, weeks: 0, error: `server answered ${status}` };
     saveConfig(c);
@@ -327,10 +349,13 @@ async function upload(c: Config, reports: Counted[]): Promise<{ repos: number; w
   }
   c.lastSync = { at: new Date().toISOString(), repos: body.repos, weeks: body.weeks };
   saveConfig(c);
+  if (body.outdated) log(`this computer runs ${runningVersion()}; the board expects ${body.minVersion} or newer — run \`gitstats update\``);
   return body;
 }
 
 async function sync(c: Config, quiet = false): Promise<void> {
+  const restarted = await selfUpdate(c);
+  if (restarted !== null) process.exit(restarted);
   const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
   const { scanned, reports } = count(c, since);
   const body = await upload(c, reports);
@@ -366,14 +391,34 @@ function writeShim(): string {
   return script;
 }
 
-function installedVersion(): string {
+function readVersion(pkgRoot: string): string {
   try {
-    const pkg: unknown = JSON.parse(readFileSync(join(SELF, "package.json"), "utf8"));
+    const pkg: unknown = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8"));
     const v = typeof pkg === "object" && pkg !== null ? (pkg as Record<string, unknown>).version : null;
     return typeof v === "string" ? v : "unknown";
   } catch {
     return "unknown";
   }
+}
+
+function installedVersion(): string {
+  return readVersion(SELF);
+}
+
+/** The copy that is executing right now — an npx run is not the installed one. */
+function runningVersion(): string {
+  return readVersion(resolve(dirname(fileURLToPath(import.meta.url)), ".."));
+}
+
+/** Numeric semver compare; a pre-release suffix is ignored, this package never ships one. */
+function isNewer(candidate: string, current: string): boolean {
+  const parts = (v: string) => v.split(/[-+]/)[0]!.split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const a = parts(candidate);
+  const b = parts(current);
+  for (let i = 0; i < 3; i++) {
+    if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+  }
+  return false;
 }
 
 /**
@@ -413,6 +458,36 @@ function update(): void {
     log(`updated ${before} → ${installedVersion()} · config and schedule untouched`);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Asks the registry for a newer version at most once a day, installs it and restarts the sync under
+ * it. Nothing here may fail a sync: offline, a registry error or a bad download is one log line and
+ * the current version carries on. `--no-update` skips the check entirely.
+ * Returns the exit code of the restarted sync, or null when this process should carry on itself.
+ */
+async function selfUpdate(c: Config): Promise<number | null> {
+  if (args.includes("--no-update")) return null;
+  const last = c.lastUpdateCheck ? Date.parse(c.lastUpdateCheck) : 0;
+  if (Number.isFinite(last) && Date.now() - last < UPDATE_EVERY_MS) return null;
+  // Stamped before the fetch, so a registry that is down is retried tomorrow and not every sync.
+  c.lastUpdateCheck = new Date().toISOString();
+  saveConfig(c);
+  const current = runningVersion();
+  try {
+    const res = await fetch(REGISTRY, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`registry answered ${res.status}`);
+    const meta: unknown = await res.json();
+    const latest = typeof meta === "object" && meta !== null ? (meta as Record<string, unknown>).version : null;
+    if (typeof latest !== "string") throw new Error("registry sent no version");
+    if (!isNewer(latest, current)) return null;
+    update();
+    const fresh = spawnSync(process.execPath, [join(SELF, "dist", "cli.js"), "sync", "--quiet"], { stdio: "inherit" });
+    return fresh.status ?? 1;
+  } catch (e) {
+    logFile(`update check failed (${e instanceof Error ? e.message : String(e)}); staying on ${current}`);
+    return null;
   }
 }
 
@@ -633,7 +708,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      log("usage: gitstats <link [--root <dir>]... [--yes] | sync | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
+      log("usage: gitstats <link [--root <dir>]... [--yes] | sync [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
   }
 }
 
