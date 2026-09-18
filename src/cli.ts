@@ -10,7 +10,8 @@
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
  *   gitstats emails add <e>   attribute commits made with another email to you
  *   gitstats names on|off     also send repo names (off by default; your own page then labels private repos by hash)
- *   gitstats unlink           remove the schedule and local config
+ *   gitstats pause | resume   stop / restart the background sync without unlinking
+ *   gitstats unlink           revoke this computer and remove the schedule and local config
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
@@ -267,6 +268,8 @@ async function sync(c: Config, quiet = false): Promise<void> {
 
 // ---------- scheduler ----------
 
+const BIN = join(DIR, "bin");
+
 function installSelf(): string {
   const here = dirname(fileURLToPath(import.meta.url)); // .../dist
   const pkgRoot = resolve(here, "..");
@@ -274,7 +277,15 @@ function installSelf(): string {
   mkdirSync(SELF, { recursive: true });
   cpSync(join(pkgRoot, "dist"), join(SELF, "dist"), { recursive: true });
   cpSync(join(pkgRoot, "package.json"), join(SELF, "package.json"));
-  return join(SELF, "dist", "cli.js");
+  const script = join(SELF, "dist", "cli.js");
+  // A `gitstats` command for shells that have ~/.gitstats/bin on PATH; npx form works regardless.
+  mkdirSync(BIN, { recursive: true });
+  if (platform() === "win32") {
+    writeFileSync(join(BIN, "gitstats.cmd"), `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+  } else {
+    writeFileSync(join(BIN, "gitstats"), `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`, { mode: 0o755 });
+  }
+  return script;
 }
 
 function installSchedule(): string {
@@ -339,8 +350,17 @@ function openBrowser(url: string): void {
 
 // ---------- commands ----------
 
+async function revokeOnServer(c: Config): Promise<boolean> {
+  const res = await fetch(`${c.server}/api/cli/unlink`, { method: "DELETE", headers: { Authorization: `Bearer ${c.token}` } }).catch(() => null);
+  return res?.ok ?? false;
+}
+
 async function link(): Promise<void> {
   const server = (args.includes("--server") ? args[args.indexOf("--server") + 1] : undefined) ?? DEFAULT_SERVER;
+  const previous = loadConfig();
+  if (previous) {
+    log(`  this computer is already linked as ${previous.login}; replacing the link${(await revokeOnServer(previous)) ? " (old one revoked)" : ""}`);
+  }
   const machine = hostname();
   const start = await post<{ code: string; pollSecret: string; verifyUrl: string; expiresIn: number }>(server, "/api/cli/device", { machine });
   if (start.status !== 200 || !start.body) throw new Error(`could not reach ${server} (HTTP ${start.status})`);
@@ -394,7 +414,11 @@ async function link(): Promise<void> {
   log(`  uploaded ${body.weeks} weekly rows for ${body.repos} repos`);
   const how = installSchedule();
   log(`\n  scheduled: ${how}`);
-  log(`  config: ${CONFIG}\n  done. Your board updates nightly; run \`gitstats sync\` any time.\n`);
+  log(`  config: ${CONFIG}`);
+  log(`\n  done. It re-syncs on its own. To run commands by hand, either use`);
+  log(`    npx --yes github:yaroslavhaidash/gitstats-cli <command>`);
+  log(`  or add ${BIN} to your PATH and use \`gitstats <command>\`.`);
+  log(`  Commands and how to stop: ${server}/docs\n`);
 }
 
 function requireConfig(): Config {
@@ -460,19 +484,25 @@ async function main(): Promise<void> {
       log(`repo names: ${c.sendNames ? "sent" : "not sent"}`);
       return;
     }
+    case "pause":
+      requireConfig();
+      removeSchedule();
+      log("background sync stopped; `gitstats resume` starts it again, `gitstats sync` still works by hand");
+      return;
+    case "resume":
+      requireConfig();
+      log(`background sync: ${installSchedule()}`);
+      return;
     case "unlink": {
       const c = loadConfig();
       removeSchedule();
-      if (c) {
-        const res = await fetch(`${c.server}/api/cli/unlink`, { method: "DELETE", headers: { Authorization: `Bearer ${c.token}` } }).catch(() => null);
-        log(res?.ok ? "revoked on the server" : "could not reach the server; revoke this computer on the settings page");
-      }
+      if (c) log((await revokeOnServer(c)) ? "revoked on the server" : "could not reach the server; revoke this computer on the settings page");
       rmSync(DIR, { recursive: true, force: true });
       log("unlinked");
       return;
     }
     default:
-      log("usage: gitstats <link [--root <dir>]... [--yes]|sync|status|add <path>|roots add <dir>|emails add <email>|names on|off|unlink>");
+      log("usage: gitstats <link [--root <dir>]... [--yes] | sync | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | unlink>");
   }
 }
 
