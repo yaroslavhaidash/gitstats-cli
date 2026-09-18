@@ -136,6 +136,7 @@ function countRepo(repo, emails, since, salt, sendNames) {
     if (out === null)
         return null;
     const weeks = new Map();
+    const days = new Map();
     const langLines = new Map();
     for (const rec of out.split("\x1e").slice(1)) {
         const [header, ...lines] = rec.split("\n");
@@ -143,9 +144,12 @@ function countRepo(repo, emails, since, salt, sendNames) {
         // --author is a substring match; keep only exact email matches.
         if (!dateStr || !authorEmail || !all.some((e) => e.toLowerCase() === authorEmail.toLowerCase()))
             continue;
-        const ws = weekStartUtc(new Date(dateStr));
+        const when = new Date(dateStr);
+        const ws = weekStartUtc(when);
         const w = weeks.get(ws) ?? { weekStart: ws, additions: 0, deletions: 0, commits: 0 };
         w.commits += 1;
+        const day = when.toISOString().slice(0, 10);
+        days.set(day, (days.get(day) ?? 0) + 1);
         for (const l of lines) {
             const [a, d, path] = l.split("\t");
             if (!a || !d || !path || a === "-" || d === "-")
@@ -168,6 +172,7 @@ function countRepo(repo, emails, since, salt, sendNames) {
         name: sendNames ? info.label : null,
         language,
         weeks: [...weeks.values()].sort((x, y) => x.weekStart.localeCompare(y.weekStart)),
+        days: [...days.entries()].map(([date, commits]) => ({ date, commits })).sort((x, y) => x.date.localeCompare(y.date)),
         path: repo,
         label: info.label,
         isWorktree: isWorktree(repo),
@@ -219,7 +224,7 @@ function count(c, since) {
     return { scanned: repos.length, reports };
 }
 async function upload(c, reports) {
-    const payload = reports.map(({ remoteHash, name, language, weeks }) => ({ remoteHash, name, language, weeks }));
+    const payload = reports.map(({ remoteHash, name, language, weeks, days }) => ({ remoteHash, name, language, weeks, days }));
     const { status, body } = await post(c.server, "/api/ingest", { repos: payload }, c.token);
     if (status !== 200 || !body) {
         c.lastSync = { at: new Date().toISOString(), repos: 0, weeks: 0, error: `server answered ${status}` };
@@ -376,7 +381,7 @@ async function link() {
     const { scanned, reports } = count(c, since);
     log(`  found ${scanned} repos, ${reports.length} with your commits in the last year:`);
     summarize(reports);
-    log(`\n  What gets sent per repo: a keyed hash of its remote URL, the language guess, and the weekly numbers above.`);
+    log(`\n  What gets sent per repo: a keyed hash of its remote URL, the language guess, the weekly numbers above, and commits-per-day counts.`);
     log(`  Repo names are NOT sent (turn on later with: gitstats names on).`);
     if (!args.includes("--yes") && !(await confirm("  Upload these numbers to your gitstats profile?"))) {
         rmSync(DIR, { recursive: true, force: true });

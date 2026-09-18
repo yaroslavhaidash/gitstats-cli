@@ -45,7 +45,8 @@ type Config = {
 };
 
 type Week = { weekStart: string; additions: number; deletions: number; commits: number };
-type RepoReport = { remoteHash: string; name: string | null; language: string | null; weeks: Week[] };
+type Day = { date: string; commits: number };
+type RepoReport = { remoteHash: string; name: string | null; language: string | null; weeks: Week[]; days: Day[] };
 type Counted = RepoReport & { path: string; label: string; isWorktree: boolean };
 
 const args = process.argv.slice(2);
@@ -160,15 +161,19 @@ function countRepo(repo: string, emails: string[], since: string, salt: string, 
   );
   if (out === null) return null;
   const weeks = new Map<string, Week>();
+  const days = new Map<string, number>();
   const langLines = new Map<string, number>();
   for (const rec of out.split("\x1e").slice(1)) {
     const [header, ...lines] = rec.split("\n");
     const [, dateStr, authorEmail] = header?.split("\x1f") ?? [];
     // --author is a substring match; keep only exact email matches.
     if (!dateStr || !authorEmail || !all.some((e) => e.toLowerCase() === authorEmail.toLowerCase())) continue;
-    const ws = weekStartUtc(new Date(dateStr));
+    const when = new Date(dateStr);
+    const ws = weekStartUtc(when);
     const w = weeks.get(ws) ?? { weekStart: ws, additions: 0, deletions: 0, commits: 0 };
     w.commits += 1;
+    const day = when.toISOString().slice(0, 10);
+    days.set(day, (days.get(day) ?? 0) + 1);
     for (const l of lines) {
       const [a, d, path] = l.split("\t");
       if (!a || !d || !path || a === "-" || d === "-") continue;
@@ -188,6 +193,7 @@ function countRepo(repo: string, emails: string[], since: string, salt: string, 
     name: sendNames ? info.label : null,
     language,
     weeks: [...weeks.values()].sort((x, y) => x.weekStart.localeCompare(y.weekStart)),
+    days: [...days.entries()].map(([date, commits]) => ({ date, commits })).sort((x, y) => x.date.localeCompare(y.date)),
     path: repo,
     label: info.label,
     isWorktree: isWorktree(repo),
@@ -244,7 +250,7 @@ function count(c: Config, since: string): { scanned: number; reports: Counted[] 
 }
 
 async function upload(c: Config, reports: Counted[]): Promise<{ repos: number; weeks: number }> {
-  const payload = reports.map(({ remoteHash, name, language, weeks }) => ({ remoteHash, name, language, weeks }));
+  const payload = reports.map(({ remoteHash, name, language, weeks, days }) => ({ remoteHash, name, language, weeks, days }));
   const { status, body } = await post<{ repos: number; weeks: number }>(c.server, "/api/ingest", { repos: payload }, c.token);
   if (status !== 200 || !body) {
     c.lastSync = { at: new Date().toISOString(), repos: 0, weeks: 0, error: `server answered ${status}` };
@@ -403,7 +409,7 @@ async function link(): Promise<void> {
   const { scanned, reports } = count(c, since);
   log(`  found ${scanned} repos, ${reports.length} with your commits in the last year:`);
   summarize(reports);
-  log(`\n  What gets sent per repo: a keyed hash of its remote URL, the language guess, and the weekly numbers above.`);
+  log(`\n  What gets sent per repo: a keyed hash of its remote URL, the language guess, the weekly numbers above, and commits-per-day counts.`);
   log(`  Repo names are NOT sent (turn on later with: gitstats names on).`);
   if (!args.includes("--yes") && !(await confirm("  Upload these numbers to your gitstats profile?"))) {
     rmSync(DIR, { recursive: true, force: true });
