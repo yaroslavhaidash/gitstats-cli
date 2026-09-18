@@ -4,7 +4,7 @@
  * numbers (per repo, per week) to your gitstats profile. No file contents, no diffs, no GitHub tokens.
  *
  *   npx gitstats-cli link     pair this computer, scan for repos, sync, install a daily sync
- *   gitstats sync             recount the last year and upload (idempotent)
+ *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent; --no-fetch to skip)
  *   gitstats status           show what is linked and when it last ran
  *   gitstats add <path>       track a repo outside the scanned folders
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
@@ -100,6 +100,20 @@ function remoteInfo(repo) {
     const norm = raw.replace(/^git@([^:]+):/, "$1/").replace(/^[a-z]+:\/\//, "").replace(/^[^@]+@/, "").replace(/\.git$/, "").replace(/\/$/, "").toLowerCase();
     return { key: `remote:${norm}`, label: norm.split("/").slice(-2).join("/") || basename(repo) };
 }
+/**
+ * Refresh origin's default branch so commits pushed from other machines are counted here too.
+ * Quiet, no credential prompts, bounded; a failure just means we count what is already local.
+ */
+function refresh(repo, ref) {
+    if (!ref.startsWith("origin/"))
+        return;
+    spawnSync("git", ["fetch", "-q", "origin", ref.slice("origin/".length)], {
+        cwd: repo,
+        stdio: "ignore",
+        timeout: 20_000,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: "ssh -o BatchMode=yes" },
+    });
+}
 function defaultRef(repo) {
     const head = git(repo, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")?.trim();
     if (head)
@@ -123,13 +137,15 @@ function weekStartUtc(d) {
     const s = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - d.getUTCDay()));
     return s.toISOString().slice(0, 10);
 }
-function countRepo(repo, emails, since, salt, sendNames) {
+function countRepo(repo, emails, since, salt, sendNames, fetch) {
     const info = remoteInfo(repo);
     const localEmail = git(repo, "config", "user.email")?.trim();
     const all = [...new Set([...emails, ...(localEmail ? [localEmail] : [])])].filter(Boolean);
     if (all.length === 0)
         return null;
     const ref = defaultRef(repo);
+    if (fetch)
+        refresh(repo, ref);
     const out = git(
     // --fixed-strings: emails like 123+login@users.noreply.github.com would otherwise be read as regex.
     repo, "log", ref, "--no-merges", "--fixed-strings", `--since=${since}`, "--numstat", "--date=iso-strict", "--format=%x1e%H%x1f%aI%x1f%ae", ...all.map((e) => `--author=${e}`));
@@ -213,8 +229,9 @@ function count(c, since) {
     const repos = findRepos(c.roots, c.repos);
     const reports = [];
     const seen = new Set();
+    const fetch = !args.includes("--no-fetch");
     for (const r of repos) {
-        const rep = countRepo(r, c.emails, since, c.salt, c.sendNames);
+        const rep = countRepo(r, c.emails, since, c.salt, c.sendNames, fetch);
         // Worktrees and extra clones share a remote; the primary clone wins (they read the same origin/HEAD anyway).
         if (rep && !seen.has(rep.remoteHash)) {
             seen.add(rep.remoteHash);

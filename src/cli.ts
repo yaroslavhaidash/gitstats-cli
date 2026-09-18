@@ -4,7 +4,7 @@
  * numbers (per repo, per week) to your gitstats profile. No file contents, no diffs, no GitHub tokens.
  *
  *   npx gitstats-cli link     pair this computer, scan for repos, sync, install a daily sync
- *   gitstats sync             recount the last year and upload (idempotent)
+ *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent; --no-fetch to skip)
  *   gitstats status           show what is linked and when it last ran
  *   gitstats add <path>       track a repo outside the scanned folders
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
@@ -123,6 +123,20 @@ function remoteInfo(repo: string): { key: string; label: string } {
   return { key: `remote:${norm}`, label: norm.split("/").slice(-2).join("/") || basename(repo) };
 }
 
+/**
+ * Refresh origin's default branch so commits pushed from other machines are counted here too.
+ * Quiet, no credential prompts, bounded; a failure just means we count what is already local.
+ */
+function refresh(repo: string, ref: string): void {
+  if (!ref.startsWith("origin/")) return;
+  spawnSync("git", ["fetch", "-q", "origin", ref.slice("origin/".length)], {
+    cwd: repo,
+    stdio: "ignore",
+    timeout: 20_000,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_SSH_COMMAND: "ssh -o BatchMode=yes" },
+  });
+}
+
 function defaultRef(repo: string): string {
   const head = git(repo, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD")?.trim();
   if (head) return head;
@@ -148,12 +162,13 @@ function weekStartUtc(d: Date): string {
   return s.toISOString().slice(0, 10);
 }
 
-function countRepo(repo: string, emails: string[], since: string, salt: string, sendNames: boolean): Counted | null {
+function countRepo(repo: string, emails: string[], since: string, salt: string, sendNames: boolean, fetch: boolean): Counted | null {
   const info = remoteInfo(repo);
   const localEmail = git(repo, "config", "user.email")?.trim();
   const all = [...new Set([...emails, ...(localEmail ? [localEmail] : [])])].filter(Boolean);
   if (all.length === 0) return null;
   const ref = defaultRef(repo);
+  if (fetch) refresh(repo, ref);
   const out = git(
     // --fixed-strings: emails like 123+login@users.noreply.github.com would otherwise be read as regex.
     repo, "log", ref, "--no-merges", "--fixed-strings", `--since=${since}`, "--numstat", "--date=iso-strict",
@@ -238,8 +253,9 @@ function count(c: Config, since: string): { scanned: number; reports: Counted[] 
   const repos = findRepos(c.roots, c.repos);
   const reports: Counted[] = [];
   const seen = new Set<string>();
+  const fetch = !args.includes("--no-fetch");
   for (const r of repos) {
-    const rep = countRepo(r, c.emails, since, c.salt, c.sendNames);
+    const rep = countRepo(r, c.emails, since, c.salt, c.sendNames, fetch);
     // Worktrees and extra clones share a remote; the primary clone wins (they read the same origin/HEAD anyway).
     if (rep && !seen.has(rep.remoteHash)) {
       seen.add(rep.remoteHash);
