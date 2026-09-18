@@ -9,10 +9,12 @@
  *   gitstats add <path>       track a repo outside the scanned folders
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
  *   gitstats emails add <e>   attribute commits made with another email to you
+ *   gitstats names on|off     also send repo names (off by default; your own page then labels private repos by hash)
  *   gitstats unlink           remove the schedule and local config
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHmac } from "node:crypto";
+import { createInterface } from "node:readline/promises";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
 import { homedir, hostname, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -29,6 +31,9 @@ const SKIP_DIRS = new Set(["node_modules", "Library", "Applications", ".Trash", 
 type Config = {
   server: string;
   token: string;
+  /** Per-user key from the server; remote URLs are HMAC'd with it, never sent in clear. */
+  salt: string;
+  sendNames: boolean;
   login: string;
   githubId: number | null;
   machine: string;
@@ -39,7 +44,8 @@ type Config = {
 };
 
 type Week = { weekStart: string; additions: number; deletions: number; commits: number };
-type RepoReport = { remoteHash: string; github: string | null; name: string; language: string | null; weeks: Week[] };
+type RepoReport = { remoteHash: string; name: string | null; language: string | null; weeks: Week[] };
+type Counted = RepoReport & { path: string; label: string; isWorktree: boolean };
 
 const args = process.argv.slice(2);
 const cmd = args[0] ?? "help";
@@ -70,6 +76,14 @@ function globalEmail(): string | null {
 
 // ---------- repo discovery ----------
 
+function isWorktree(repo: string): boolean {
+  try {
+    return statSync(join(repo, ".git")).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function findRepos(roots: string[], explicit: string[]): string[] {
   const found = new Set<string>(explicit.filter((p) => existsSync(join(p, ".git"))));
   const walk = (dir: string, depth: number) => {
@@ -95,16 +109,16 @@ function findRepos(roots: string[], explicit: string[]): string[] {
     }
   };
   for (const r of roots) walk(r, 0);
-  return [...found].sort();
+  // Real clones before worktrees, so the dedupe below keeps the primary checkout.
+  return [...found].sort((a, b) => Number(isWorktree(a)) - Number(isWorktree(b)) || a.localeCompare(b));
 }
 
-function remoteInfo(repo: string): { key: string; github: string | null; name: string } {
+/** `remote:github.com/owner/name` (lower-cased, no protocol/user/.git) or `path:<dir>` when there is no remote. */
+function remoteInfo(repo: string): { key: string; label: string } {
   const raw = git(repo, "config", "--get", "remote.origin.url")?.trim();
-  if (!raw) return { key: `path:${repo}`, github: null, name: basename(repo) };
-  let norm = raw.replace(/^git@([^:]+):/, "$1/").replace(/^[a-z]+:\/\//, "").replace(/^[^@]+@/, "").replace(/\.git$/, "").replace(/\/$/, "");
-  norm = norm.toLowerCase();
-  const m = /^github\.com\/([\w.-]+)\/([\w.-]+)$/.exec(norm);
-  return { key: `remote:${norm}`, github: m ? `${m[1]}/${m[2]}` : null, name: norm.split("/").slice(-2).join("/") || basename(repo) };
+  if (!raw) return { key: `path:${repo}`, label: basename(repo) };
+  const norm = raw.replace(/^git@([^:]+):/, "$1/").replace(/^[a-z]+:\/\//, "").replace(/^[^@]+@/, "").replace(/\.git$/, "").replace(/\/$/, "").toLowerCase();
+  return { key: `remote:${norm}`, label: norm.split("/").slice(-2).join("/") || basename(repo) };
 }
 
 function defaultRef(repo: string): string {
@@ -132,7 +146,7 @@ function weekStartUtc(d: Date): string {
   return s.toISOString().slice(0, 10);
 }
 
-function countRepo(repo: string, emails: string[], since: string): RepoReport | null {
+function countRepo(repo: string, emails: string[], since: string, salt: string, sendNames: boolean): Counted | null {
   const info = remoteInfo(repo);
   const localEmail = git(repo, "config", "user.email")?.trim();
   const all = [...new Set([...emails, ...(localEmail ? [localEmail] : [])])].filter(Boolean);
@@ -141,15 +155,16 @@ function countRepo(repo: string, emails: string[], since: string): RepoReport | 
   const out = git(
     // --fixed-strings: emails like 123+login@users.noreply.github.com would otherwise be read as regex.
     repo, "log", ref, "--no-merges", "--fixed-strings", `--since=${since}`, "--numstat", "--date=iso-strict",
-    "--format=%x1e%H%x1f%aI", ...all.map((e) => `--author=${e}`),
+    "--format=%x1e%H%x1f%aI%x1f%ae", ...all.map((e) => `--author=${e}`),
   );
   if (out === null) return null;
   const weeks = new Map<string, Week>();
   const langLines = new Map<string, number>();
   for (const rec of out.split("\x1e").slice(1)) {
     const [header, ...lines] = rec.split("\n");
-    const dateStr = header?.split("\x1f")[1];
-    if (!dateStr) continue;
+    const [, dateStr, authorEmail] = header?.split("\x1f") ?? [];
+    // --author is a substring match; keep only exact email matches.
+    if (!dateStr || !authorEmail || !all.some((e) => e.toLowerCase() === authorEmail.toLowerCase())) continue;
     const ws = weekStartUtc(new Date(dateStr));
     const w = weeks.get(ws) ?? { weekStart: ws, additions: 0, deletions: 0, commits: 0 };
     w.commits += 1;
@@ -168,11 +183,13 @@ function countRepo(repo: string, emails: string[], since: string): RepoReport | 
   if (weeks.size === 0) return null;
   const language = [...langLines.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? null;
   return {
-    remoteHash: createHash("sha256").update(info.key).digest("hex"),
-    github: info.github,
-    name: info.name,
+    remoteHash: createHmac("sha256", salt).update(info.key).digest("hex"),
+    name: sendNames ? info.label : null,
     language,
     weeks: [...weeks.values()].sort((x, y) => x.weekStart.localeCompare(y.weekStart)),
+    path: repo,
+    label: info.label,
+    isWorktree: isWorktree(repo),
   };
 }
 
@@ -194,20 +211,40 @@ async function post<T>(server: string, path: string, body: unknown, token?: stri
   return { status: res.status, body: parsed };
 }
 
-async function sync(c: Config, quiet = false): Promise<void> {
-  const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
+function summarize(reports: Counted[]): void {
+  for (const r of reports) {
+    const a = r.weeks.reduce((n, w) => n + w.additions, 0);
+    const d = r.weeks.reduce((n, w) => n + w.deletions, 0);
+    const cm = r.weeks.reduce((n, w) => n + w.commits, 0);
+    log(`  ${r.label.padEnd(40)} ${String(cm).padStart(5)} commits  +${a} −${d}`);
+  }
+}
+
+async function confirm(question: string): Promise<boolean> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (await rl.question(`${question} [Y/n] `)).trim().toLowerCase();
+  rl.close();
+  return answer === "" || answer === "y" || answer === "yes";
+}
+
+function count(c: Config, since: string): { scanned: number; reports: Counted[] } {
   const repos = findRepos(c.roots, c.repos);
-  const reports: RepoReport[] = [];
+  const reports: Counted[] = [];
   const seen = new Set<string>();
   for (const r of repos) {
-    const rep = countRepo(r, c.emails, since);
-    // Worktrees and extra clones share a remote; the first one wins, they see the same origin/HEAD anyway.
+    const rep = countRepo(r, c.emails, since, c.salt, c.sendNames);
+    // Worktrees and extra clones share a remote; the primary clone wins (they read the same origin/HEAD anyway).
     if (rep && !seen.has(rep.remoteHash)) {
       seen.add(rep.remoteHash);
       reports.push(rep);
     }
   }
-  const { status, body } = await post<{ repos: number; weeks: number }>(c.server, "/api/ingest", { machine: c.machine, repos: reports }, c.token);
+  return { scanned: repos.length, reports };
+}
+
+async function upload(c: Config, reports: Counted[]): Promise<{ repos: number; weeks: number }> {
+  const payload = reports.map(({ remoteHash, name, language, weeks }) => ({ remoteHash, name, language, weeks }));
+  const { status, body } = await post<{ repos: number; weeks: number }>(c.server, "/api/ingest", { repos: payload }, c.token);
   if (status !== 200 || !body) {
     c.lastSync = { at: new Date().toISOString(), repos: 0, weeks: 0, error: `server answered ${status}` };
     saveConfig(c);
@@ -215,14 +252,16 @@ async function sync(c: Config, quiet = false): Promise<void> {
   }
   c.lastSync = { at: new Date().toISOString(), repos: body.repos, weeks: body.weeks };
   saveConfig(c);
+  return body;
+}
+
+async function sync(c: Config, quiet = false): Promise<void> {
+  const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
+  const { scanned, reports } = count(c, since);
+  const body = await upload(c, reports);
   if (!quiet) {
-    log(`scanned ${repos.length} repos, ${reports.length} with your commits in the last year, ${body.weeks} weekly rows sent`);
-    for (const r of reports) {
-      const a = r.weeks.reduce((n, w) => n + w.additions, 0);
-      const d = r.weeks.reduce((n, w) => n + w.deletions, 0);
-      const cm = r.weeks.reduce((n, w) => n + w.commits, 0);
-      log(`  ${r.name.padEnd(40)} ${String(cm).padStart(5)} commits  +${a} −${d}`);
-    }
+    log(`scanned ${scanned} repos, ${reports.length} with your commits in the last year, ${body.weeks} weekly rows sent`);
+    summarize(reports);
   }
 }
 
@@ -309,13 +348,13 @@ async function link(): Promise<void> {
   log(`  Code: ${start.body.code}\n`);
   openBrowser(start.body.verifyUrl);
   const deadline = Date.now() + start.body.expiresIn * 1000;
-  let done: { token: string; login: string; githubId: number | null } | null = null;
+  let done: { token: string; login: string; githubId: number | null; salt: string } | null = null;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 3000));
-    const p = await post<{ status: string; token?: string; login?: string; githubId?: number | null }>(server, "/api/cli/device/poll", { pollSecret: start.body.pollSecret });
+    const p = await post<{ status: string; token?: string; login?: string; githubId?: number | null; salt?: string }>(server, "/api/cli/device/poll", { pollSecret: start.body.pollSecret });
     if (p.status === 410) throw new Error("the code expired; run link again");
-    if (p.body?.status === "ok" && p.body.token && p.body.login) {
-      done = { token: p.body.token, login: p.body.login, githubId: p.body.githubId ?? null };
+    if (p.body?.status === "ok" && p.body.token && p.body.login && p.body.salt) {
+      done = { token: p.body.token, login: p.body.login, githubId: p.body.githubId ?? null, salt: p.body.salt };
       break;
     }
   }
@@ -328,6 +367,8 @@ async function link(): Promise<void> {
   const c: Config = {
     server,
     token: done.token,
+    salt: done.salt,
+    sendNames: false,
     login: done.login,
     githubId: done.githubId,
     machine,
@@ -337,8 +378,20 @@ async function link(): Promise<void> {
   };
   saveConfig(c);
   log(`  linked as ${done.login} · counting commits by: ${[...emails].join(", ") || "(no email found; run: gitstats emails add you@example.com)"}`);
-  log(`  scanning ${c.roots.join(", ")} for git repos… (this first run can take a minute)`);
-  await sync(c);
+  log(`  scanning ${c.roots.join(", ")} for git repos… (this first run can take a minute)\n`);
+  const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
+  const { scanned, reports } = count(c, since);
+  log(`  found ${scanned} repos, ${reports.length} with your commits in the last year:`);
+  summarize(reports);
+  log(`\n  What gets sent per repo: a keyed hash of its remote URL, the language guess, and the weekly numbers above.`);
+  log(`  Repo names are NOT sent (turn on later with: gitstats names on).`);
+  if (!args.includes("--yes") && !(await confirm("  Upload these numbers to your gitstats profile?"))) {
+    rmSync(DIR, { recursive: true, force: true });
+    log("  cancelled; nothing was uploaded and the link was removed locally (revoke it on the settings page).");
+    return;
+  }
+  const body = await upload(c, reports);
+  log(`  uploaded ${body.weeks} weekly rows for ${body.repos} repos`);
   const how = installSchedule();
   log(`\n  scheduled: ${how}`);
   log(`  config: ${CONFIG}\n  done. Your board updates nightly; run \`gitstats sync\` any time.\n`);
@@ -396,13 +449,30 @@ async function main(): Promise<void> {
       log(`emails: ${c.emails.join(", ")}`);
       return;
     }
-    case "unlink":
-      removeSchedule();
-      rmSync(DIR, { recursive: true, force: true });
-      log("unlinked; revoke this computer on the settings page too");
+    case "names": {
+      const c = requireConfig();
+      if (args[1] === "on" || args[1] === "off") {
+        c.sendNames = args[1] === "on";
+        saveConfig(c);
+        log(`repo names: ${c.sendNames ? "sent (others see them only if your settings allow)" : "not sent"}`);
+        return sync(c);
+      }
+      log(`repo names: ${c.sendNames ? "sent" : "not sent"}`);
       return;
+    }
+    case "unlink": {
+      const c = loadConfig();
+      removeSchedule();
+      if (c) {
+        const res = await fetch(`${c.server}/api/cli/unlink`, { method: "DELETE", headers: { Authorization: `Bearer ${c.token}` } }).catch(() => null);
+        log(res?.ok ? "revoked on the server" : "could not reach the server; revoke this computer on the settings page");
+      }
+      rmSync(DIR, { recursive: true, force: true });
+      log("unlinked");
+      return;
+    }
     default:
-      log("usage: gitstats <link [--root <dir>]...|sync|status|add <path>|roots add <dir>|emails add <email>|unlink>");
+      log("usage: gitstats <link [--root <dir>]... [--yes]|sync|status|add <path>|roots add <dir>|emails add <email>|names on|off|unlink>");
   }
 }
 
