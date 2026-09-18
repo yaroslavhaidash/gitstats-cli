@@ -137,20 +137,8 @@ function weekStartUtc(d) {
     const s = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - d.getUTCDay()));
     return s.toISOString().slice(0, 10);
 }
-function countRepo(repo, emails, since, salt, sendNames, fetch) {
-    const info = remoteInfo(repo);
-    const localEmail = git(repo, "config", "user.email")?.trim();
-    const all = [...new Set([...emails, ...(localEmail ? [localEmail] : [])])].filter(Boolean);
-    if (all.length === 0)
-        return null;
-    const ref = defaultRef(repo);
-    if (fetch)
-        refresh(repo, ref);
-    const out = git(
-    // --fixed-strings: emails like 123+login@users.noreply.github.com would otherwise be read as regex.
-    repo, "log", ref, "--no-merges", "--fixed-strings", `--since=${since}`, "--numstat", "--date=iso-strict", "--format=%x1e%H%x1f%aI%x1f%ae", ...all.map((e) => `--author=${e}`));
-    if (out === null)
-        return null;
+/** Read one `git log --numstat` run into week and day buckets. Same rules for merged and pending work. */
+function tally(out, all) {
     const weeks = new Map();
     const days = new Map();
     const langLines = new Map();
@@ -184,15 +172,44 @@ function countRepo(repo, emails, since, salt, sendNames, fetch) {
         weeks.set(ws, w);
         days.set(date, day);
     }
-    if (weeks.size === 0)
+    return { weeks, days, langLines };
+}
+function buckets(t) {
+    return {
+        weeks: [...t.weeks.values()].sort((x, y) => x.weekStart.localeCompare(y.weekStart)),
+        days: [...t.days.values()].sort((x, y) => x.date.localeCompare(y.date)),
+    };
+}
+const EMPTY_TALLY = () => ({ weeks: new Map(), days: new Map(), langLines: new Map() });
+function countRepo(repo, emails, since, salt, sendNames, fetch) {
+    const info = remoteInfo(repo);
+    const localEmail = git(repo, "config", "user.email")?.trim();
+    const all = [...new Set([...emails, ...(localEmail ? [localEmail] : [])])].filter(Boolean);
+    if (all.length === 0)
         return null;
+    const ref = defaultRef(repo);
+    if (fetch)
+        refresh(repo, ref);
+    // --fixed-strings: emails like 123+login@users.noreply.github.com would otherwise be read as regex.
+    const common = ["--no-merges", "--fixed-strings", `--since=${since}`, "--numstat", "--date=iso-strict", "--format=%x1e%H%x1f%aI%x1f%ae"];
+    const authors = all.map((e) => `--author=${e}`);
+    const out = git(repo, "log", ref, ...common, ...authors);
+    if (out === null)
+        return null;
+    // Everything on any other local or remote branch that the default branch has not taken in yet.
+    const pendingOut = git(repo, "log", "--all", "--not", ref, ...common, ...authors);
+    const merged = tally(out, all);
+    const pending = pendingOut === null ? EMPTY_TALLY() : tally(pendingOut, all);
+    if (merged.weeks.size === 0 && pending.weeks.size === 0)
+        return null;
+    const langLines = merged.langLines.size > 0 ? merged.langLines : pending.langLines;
     const language = [...langLines.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? null;
     return {
         remoteHash: createHmac("sha256", salt).update(info.key).digest("hex"),
         name: sendNames ? info.label : null,
         language,
-        weeks: [...weeks.values()].sort((x, y) => x.weekStart.localeCompare(y.weekStart)),
-        days: [...days.values()].sort((x, y) => x.date.localeCompare(y.date)),
+        ...buckets(merged),
+        pending: buckets(pending),
         path: repo,
         label: info.label,
         isWorktree: isWorktree(repo),
@@ -220,7 +237,8 @@ function summarize(reports) {
         const a = r.weeks.reduce((n, w) => n + w.additions, 0);
         const d = r.weeks.reduce((n, w) => n + w.deletions, 0);
         const cm = r.weeks.reduce((n, w) => n + w.commits, 0);
-        log(`  ${r.label.padEnd(40)} ${String(cm).padStart(5)} commits  +${a} −${d}`);
+        const pending = r.pending.weeks.reduce((n, w) => n + w.commits, 0);
+        log(`  ${r.label.padEnd(40)} ${String(cm).padStart(5)} commits  +${a} −${d}${pending > 0 ? `  (${pending} pending)` : ""}`);
     }
 }
 async function confirm(question) {
@@ -247,7 +265,7 @@ function count(c, since) {
     return { scanned: repos.length, reports };
 }
 async function upload(c, reports) {
-    const payload = reports.map(({ remoteHash, name, language, weeks, days }) => ({ remoteHash, name, language, weeks, days }));
+    const payload = reports.map(({ remoteHash, name, language, weeks, days, pending }) => ({ remoteHash, name, language, weeks, days, pending }));
     const { status, body } = await post(c.server, "/api/ingest", { repos: payload }, c.token);
     if (status !== 200 || !body) {
         c.lastSync = { at: new Date().toISOString(), repos: 0, weeks: 0, error: `server answered ${status}` };
