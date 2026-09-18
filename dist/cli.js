@@ -231,12 +231,14 @@ function count(c, since) {
     const seen = new Set();
     const fetch = !args.includes("--no-fetch");
     for (const r of repos) {
+        // Worktrees and extra clones share a remote: fetch and count the primary clone only (they read the same origin/HEAD).
+        const key = remoteInfo(r).key;
+        if (seen.has(key))
+            continue;
+        seen.add(key);
         const rep = countRepo(r, c.emails, since, c.salt, c.sendNames, fetch);
-        // Worktrees and extra clones share a remote; the primary clone wins (they read the same origin/HEAD anyway).
-        if (rep && !seen.has(rep.remoteHash)) {
-            seen.add(rep.remoteHash);
+        if (rep)
             reports.push(rep);
-        }
     }
     return { scanned: repos.length, reports };
 }
