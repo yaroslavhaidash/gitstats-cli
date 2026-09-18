@@ -45,7 +45,7 @@ type Config = {
 };
 
 type Week = { weekStart: string; additions: number; deletions: number; commits: number };
-type Day = { date: string; commits: number };
+type Day = { date: string; additions: number; deletions: number; commits: number };
 type RepoReport = { remoteHash: string; name: string | null; language: string | null; weeks: Week[]; days: Day[] };
 type Counted = RepoReport & { path: string; label: string; isWorktree: boolean };
 
@@ -176,7 +176,7 @@ function countRepo(repo: string, emails: string[], since: string, salt: string, 
   );
   if (out === null) return null;
   const weeks = new Map<string, Week>();
-  const days = new Map<string, number>();
+  const days = new Map<string, Day>();
   const langLines = new Map<string, number>();
   for (const rec of out.split("\x1e").slice(1)) {
     const [header, ...lines] = rec.split("\n");
@@ -187,19 +187,23 @@ function countRepo(repo: string, emails: string[], since: string, salt: string, 
     const ws = weekStartUtc(when);
     const w = weeks.get(ws) ?? { weekStart: ws, additions: 0, deletions: 0, commits: 0 };
     w.commits += 1;
-    const day = when.toISOString().slice(0, 10);
-    days.set(day, (days.get(day) ?? 0) + 1);
+    const date = when.toISOString().slice(0, 10);
+    const day = days.get(date) ?? { date, additions: 0, deletions: 0, commits: 0 };
+    day.commits += 1;
     for (const l of lines) {
       const [a, d, path] = l.split("\t");
       if (!a || !d || !path || a === "-" || d === "-") continue;
       w.additions += Number(a);
       w.deletions += Number(d);
+      day.additions += Number(a);
+      day.deletions += Number(d);
       const file = basename(path);
       const ext = file.includes(".") ? file.split(".").pop()!.toLowerCase() : "";
       const lang = LANG[ext];
       if (lang && !NOISE.has(file)) langLines.set(lang, (langLines.get(lang) ?? 0) + Number(a) + Number(d));
     }
     weeks.set(ws, w);
+    days.set(date, day);
   }
   if (weeks.size === 0) return null;
   const language = [...langLines.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? null;
@@ -208,7 +212,7 @@ function countRepo(repo: string, emails: string[], since: string, salt: string, 
     name: sendNames ? info.label : null,
     language,
     weeks: [...weeks.values()].sort((x, y) => x.weekStart.localeCompare(y.weekStart)),
-    days: [...days.entries()].map(([date, commits]) => ({ date, commits })).sort((x, y) => x.date.localeCompare(y.date)),
+    days: [...days.values()].sort((x, y) => x.date.localeCompare(y.date)),
     path: repo,
     label: info.label,
     isWorktree: isWorktree(repo),

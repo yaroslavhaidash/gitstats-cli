@@ -164,14 +164,17 @@ function countRepo(repo, emails, since, salt, sendNames, fetch) {
         const ws = weekStartUtc(when);
         const w = weeks.get(ws) ?? { weekStart: ws, additions: 0, deletions: 0, commits: 0 };
         w.commits += 1;
-        const day = when.toISOString().slice(0, 10);
-        days.set(day, (days.get(day) ?? 0) + 1);
+        const date = when.toISOString().slice(0, 10);
+        const day = days.get(date) ?? { date, additions: 0, deletions: 0, commits: 0 };
+        day.commits += 1;
         for (const l of lines) {
             const [a, d, path] = l.split("\t");
             if (!a || !d || !path || a === "-" || d === "-")
                 continue;
             w.additions += Number(a);
             w.deletions += Number(d);
+            day.additions += Number(a);
+            day.deletions += Number(d);
             const file = basename(path);
             const ext = file.includes(".") ? file.split(".").pop().toLowerCase() : "";
             const lang = LANG[ext];
@@ -179,6 +182,7 @@ function countRepo(repo, emails, since, salt, sendNames, fetch) {
                 langLines.set(lang, (langLines.get(lang) ?? 0) + Number(a) + Number(d));
         }
         weeks.set(ws, w);
+        days.set(date, day);
     }
     if (weeks.size === 0)
         return null;
@@ -188,7 +192,7 @@ function countRepo(repo, emails, since, salt, sendNames, fetch) {
         name: sendNames ? info.label : null,
         language,
         weeks: [...weeks.values()].sort((x, y) => x.weekStart.localeCompare(y.weekStart)),
-        days: [...days.entries()].map(([date, commits]) => ({ date, commits })).sort((x, y) => x.date.localeCompare(y.date)),
+        days: [...days.values()].sort((x, y) => x.date.localeCompare(y.date)),
         path: repo,
         label: info.label,
         isWorktree: isWorktree(repo),
