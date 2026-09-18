@@ -3,7 +3,7 @@
  * gitstats CLI — counts commits and lines in the git repos on this machine and sends ONLY the
  * numbers (per repo, per week) to your gitstats profile. No file contents, no diffs, no GitHub tokens.
  *
- *   npx --yes github:yaroslavhaidash/gitstats-cli link
+ *   npx @yaroslavhaidash/gitstats-cli@latest link
  *                             pair this computer, scan for repos, sync, install a daily sync
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent; --no-fetch to skip)
  *   gitstats status           show what is linked and when it last ran
@@ -29,6 +29,7 @@ const DIR = join(HOME, ".gitstats");
 const CONFIG = join(DIR, "config.json");
 const SELF = join(DIR, "cli");
 const DAYS = 365;
+const PENDING_DAYS = 30;
 const SKIP_DIRS = new Set(["node_modules", "Library", "Applications", ".Trash", "vendor", "target", "build", "dist", ".venv", "venv", "__pycache__", "Pods", "DerivedData", "go", ".cargo", ".rustup", ".npm", ".cache", ".local", "snap", "AppData"]);
 const args = process.argv.slice(2);
 const cmd = args[0] ?? "help";
@@ -127,6 +128,30 @@ function defaultRef(repo) {
     }
     return "HEAD";
 }
+/**
+ * Remote branches whose work has not landed on the default branch yet. Only `refs/remotes/origin`
+ * counts, and only tips touched in the last 30 days: local branches left behind by squash-merged
+ * worktrees are the same commits over again, and they inflated pending by 14x.
+ */
+function pendingRefs(repo, ref) {
+    const out = git(repo, "for-each-ref", "--format=%(refname) %(committerdate:unix)", "refs/remotes/origin");
+    if (out === null)
+        return [];
+    const cutoff = Date.now() / 1000 - PENDING_DAYS * 86_400;
+    const refs = [];
+    for (const line of out.split("\n")) {
+        const [name, when] = line.split(" ");
+        if (!name || !when)
+            continue;
+        const short = name.slice("refs/remotes/".length);
+        if (short === ref || short === "origin/HEAD")
+            continue;
+        if (Number(when) < cutoff)
+            continue;
+        refs.push(name);
+    }
+    return refs;
+}
 // ---------- counting ----------
 const LANG = {
     ts: "TypeScript", tsx: "TypeScript", js: "JavaScript", jsx: "JavaScript", mjs: "JavaScript", cjs: "JavaScript",
@@ -199,8 +224,8 @@ function countRepo(repo, emails, since, salt, sendNames, fetch) {
     const out = git(repo, "log", ref, ...common, ...authors);
     if (out === null)
         return null;
-    // Everything on any other local or remote branch that the default branch has not taken in yet.
-    const pendingOut = git(repo, "log", "--all", "--not", ref, ...common, ...authors);
+    const unmerged = pendingRefs(repo, ref);
+    const pendingOut = unmerged.length > 0 ? git(repo, "log", ...unmerged, "--not", ref, ...common, ...authors) : null;
     const merged = tally(out, all);
     const pending = pendingOut === null ? EMPTY_TALLY() : tally(pendingOut, all);
     if (merged.weeks.size === 0 && pending.weeks.size === 0)
@@ -493,14 +518,14 @@ async function link() {
     log(`\n  scheduled: ${how}`);
     log(`  config: ${CONFIG}`);
     log(`\n  done. It re-syncs on its own. To run commands by hand, either use`);
-    log(`    npx --yes github:yaroslavhaidash/gitstats-cli <command>`);
+    log(`    npx @yaroslavhaidash/gitstats-cli@latest <command>`);
     log(`  or add ${BIN} to your PATH and use \`gitstats <command>\`.`);
     log(`  Commands and how to stop: ${server}/docs\n`);
 }
 function requireConfig() {
     const c = loadConfig();
     if (!c)
-        throw new Error("not linked yet; run: npx --yes github:yaroslavhaidash/gitstats-cli link");
+        throw new Error("not linked yet; run: npx @yaroslavhaidash/gitstats-cli@latest link");
     return c;
 }
 async function main() {

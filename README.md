@@ -3,7 +3,7 @@
 Counts commits and lines in the git repos on your computer and sends **only the numbers** (per repo, per week) to your [gitstats](https://gitstats-three-zeta.vercel.app) profile. No file contents, no diffs, no GitHub tokens, no permissions on GitHub.
 
 ```bash
-npx --yes github:yaroslavhaidash/gitstats-cli link
+npx @yaroslavhaidash/gitstats-cli@latest link
 ```
 
 That pairs this computer (you confirm in the browser), scans your home folder for repos, uploads the last year, and installs a daily background sync (launchd on macOS, Task Scheduler on Windows, systemd user timer on Linux). Nothing else to remember.
