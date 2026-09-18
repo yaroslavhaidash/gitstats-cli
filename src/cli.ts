@@ -3,7 +3,8 @@
  * gitstats CLI — counts commits and lines in the git repos on this machine and sends ONLY the
  * numbers (per repo, per week) to your gitstats profile. No file contents, no diffs, no GitHub tokens.
  *
- *   npx gitstats-cli link     pair this computer, scan for repos, sync, install a daily sync
+ *   npx --yes github:yaroslavhaidash/gitstats-cli link
+ *                             pair this computer, scan for repos, sync, install a daily sync
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent; --no-fetch to skip)
  *   gitstats status           show what is linked and when it last ran
  *   gitstats add <path>       track a repo outside the scanned folders
@@ -11,17 +12,19 @@
  *   gitstats emails add <e>   attribute commits made with another email to you
  *   gitstats names on|off     also send repo names (off by default; your own page then labels private repos by hash)
  *   gitstats pause | resume   stop / restart the background sync without unlinking
+ *   gitstats update           fetch the latest published version and replace the installed copy
  *   gitstats unlink           revoke this computer and remove the schedule and local config
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { createInterface } from "node:readline/promises";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
-import { homedir, hostname, platform } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
+import { homedir, hostname, platform, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_SERVER = "https://gitstats-three-zeta.vercel.app";
+const PKG = "gitstats-cli";
 const HOME = homedir();
 const DIR = join(HOME, ".gitstats");
 const CONFIG = join(DIR, "config.json");
@@ -326,8 +329,12 @@ function installSelf(): string {
   mkdirSync(SELF, { recursive: true });
   cpSync(join(pkgRoot, "dist"), join(SELF, "dist"), { recursive: true });
   cpSync(join(pkgRoot, "package.json"), join(SELF, "package.json"));
+  return writeShim();
+}
+
+/** A `gitstats` command for shells that have ~/.gitstats/bin on PATH; the npx form works regardless. */
+function writeShim(): string {
   const script = join(SELF, "dist", "cli.js");
-  // A `gitstats` command for shells that have ~/.gitstats/bin on PATH; npx form works regardless.
   mkdirSync(BIN, { recursive: true });
   if (platform() === "win32") {
     writeFileSync(join(BIN, "gitstats.cmd"), `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
@@ -335,6 +342,56 @@ function installSelf(): string {
     writeFileSync(join(BIN, "gitstats"), `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`, { mode: 0o755 });
   }
   return script;
+}
+
+function installedVersion(): string {
+  try {
+    const pkg: unknown = JSON.parse(readFileSync(join(SELF, "package.json"), "utf8"));
+    const v = typeof pkg === "object" && pkg !== null ? (pkg as Record<string, unknown>).version : null;
+    return typeof v === "string" ? v : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Replace ~/.gitstats/cli with the latest published package. The schedule points at an absolute
+ * path inside it and the config lives beside it, so neither is touched.
+ */
+function update(): void {
+  const before = installedVersion();
+  const tmp = mkdtempSync(join(tmpdir(), "gitstats-update-"));
+  try {
+    const pack = spawnSync("npm", ["pack", `${PKG}@latest`, "--pack-destination", tmp], {
+      encoding: "utf8",
+      timeout: 120_000,
+      shell: platform() === "win32",
+    });
+    if (pack.status !== 0) {
+      // npm says why far better than we could (404, offline, proxy); its last line is just a log path.
+      const why =
+        (pack.stderr ?? "")
+          .split("\n")
+          .map((l) => l.replace(/^npm (error|ERR!)\s*/, "").trim())
+          .find((l) => l.length > 0 && !l.startsWith("A complete log")) ?? "is npm on PATH?";
+      throw new Error(`could not download ${PKG}@latest — ${why}`);
+    }
+    const tgz = readdirSync(tmp).find((f) => f.endsWith(".tgz"));
+    if (!tgz) throw new Error("npm pack downloaded nothing");
+    // Unpack first: only replace the installed copy once we know the download is good.
+    const untar = spawnSync("tar", ["-xzf", join(tmp, tgz), "-C", tmp], { timeout: 60_000 });
+    if (untar.status !== 0) throw new Error("could not unpack the download (is tar available?)");
+    const root = join(tmp, "package");
+    if (!existsSync(join(root, "dist", "cli.js"))) throw new Error("the published package has no dist/cli.js");
+    rmSync(join(SELF, "dist"), { recursive: true, force: true });
+    mkdirSync(SELF, { recursive: true });
+    cpSync(join(root, "dist"), join(SELF, "dist"), { recursive: true });
+    cpSync(join(root, "package.json"), join(SELF, "package.json"));
+    writeShim();
+    log(`updated ${before} → ${installedVersion()} · config and schedule untouched`);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 function installSchedule(): string {
@@ -472,7 +529,7 @@ async function link(): Promise<void> {
 
 function requireConfig(): Config {
   const c = loadConfig();
-  if (!c) throw new Error("not linked yet; run: npx gitstats-cli link");
+  if (!c) throw new Error("not linked yet; run: npx --yes github:yaroslavhaidash/gitstats-cli link");
   return c;
 }
 
@@ -542,6 +599,9 @@ async function main(): Promise<void> {
       requireConfig();
       log(`background sync: ${installSchedule()}`);
       return;
+    case "update":
+      requireConfig();
+      return update();
     case "unlink": {
       const c = loadConfig();
       removeSchedule();
@@ -551,7 +611,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      log("usage: gitstats <link [--root <dir>]... [--yes] | sync | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | unlink>");
+      log("usage: gitstats <link [--root <dir>]... [--yes] | sync | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
   }
 }
 
