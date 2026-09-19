@@ -7,7 +7,7 @@
  *                             pair this computer, scan for repos, sync, install a daily sync
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent;
  *                             --no-fetch skips the fetch, --no-update skips the daily version check)
- *   gitstats status           show what is linked and when it last ran
+ *   gitstats status           what is linked, whether the background sync is scheduled, when it last ran
  *   gitstats add <path>       track a repo outside the scanned folders
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
  *   gitstats emails add <e>   attribute commits made with another email to you
@@ -335,13 +335,30 @@ async function sync(c, quiet = false) {
 }
 // ---------- scheduler ----------
 const BIN = join(DIR, "bin");
+/**
+ * Put this package in ~/.gitstats/cli so the schedule has an absolute path that survives npx.
+ * The PATH shim and every scheduled run already exec the installed copy, so `pkgRoot === SELF` is
+ * the normal case for `resume` and a re-run of `link`: replacing the install would mean deleting
+ * the very files being read. Then only the shim is rewritten. An install from anywhere else is
+ * staged in a temp dir first, so a failed copy can never leave a half-installed ~/.gitstats/cli.
+ */
 function installSelf() {
     const here = dirname(fileURLToPath(import.meta.url)); // .../dist
     const pkgRoot = resolve(here, "..");
-    rmSync(SELF, { recursive: true, force: true });
-    mkdirSync(SELF, { recursive: true });
-    cpSync(join(pkgRoot, "dist"), join(SELF, "dist"), { recursive: true });
-    cpSync(join(pkgRoot, "package.json"), join(SELF, "package.json"));
+    if (pkgRoot === resolve(SELF))
+        return writeShim();
+    const tmp = mkdtempSync(join(tmpdir(), "gitstats-install-"));
+    try {
+        cpSync(join(pkgRoot, "dist"), join(tmp, "dist"), { recursive: true });
+        cpSync(join(pkgRoot, "package.json"), join(tmp, "package.json"));
+        rmSync(SELF, { recursive: true, force: true });
+        mkdirSync(SELF, { recursive: true });
+        cpSync(join(tmp, "dist"), join(SELF, "dist"), { recursive: true });
+        cpSync(join(tmp, "package.json"), join(SELF, "package.json"));
+    }
+    finally {
+        rmSync(tmp, { recursive: true, force: true });
+    }
     return writeShim();
 }
 /** A `gitstats` command for shells that have ~/.gitstats/bin on PATH; the npx form works regardless. */
@@ -461,12 +478,24 @@ async function selfUpdate(c) {
         return null;
     }
 }
+const PLIST = join(HOME, "Library", "LaunchAgents", "com.gitstats.sync.plist");
+const UNIT_DIR = join(HOME, ".config", "systemd", "user");
+const TIMER = join(UNIT_DIR, "gitstats-sync.timer");
+/** Whether the background sync is scheduled at all — `pause` removes the entry, `resume` puts it back. */
+function scheduleInstalled() {
+    const os = platform();
+    if (os === "darwin")
+        return existsSync(PLIST);
+    if (os === "win32")
+        return spawnSync("schtasks", ["/Query", "/TN", "gitstats-sync"], { stdio: "ignore" }).status === 0;
+    return existsSync(TIMER);
+}
 function installSchedule() {
     const script = installSelf();
     const node = process.execPath;
     const os = platform();
     if (os === "darwin") {
-        const plist = join(HOME, "Library", "LaunchAgents", "com.gitstats.sync.plist");
+        const plist = PLIST;
         mkdirSync(dirname(plist), { recursive: true });
         writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -491,10 +520,9 @@ function installSchedule() {
         spawnSync("powershell", ["-NoProfile", "-Command", ps], { stdio: "ignore" });
         return "Task Scheduler task gitstats-sync (daily 12:00, runs late if missed)";
     }
-    const unitDir = join(HOME, ".config", "systemd", "user");
-    mkdirSync(unitDir, { recursive: true });
-    writeFileSync(join(unitDir, "gitstats-sync.service"), `[Unit]\nDescription=gitstats sync\n\n[Service]\nType=oneshot\nExecStart=${node} ${script} sync --quiet\n`);
-    writeFileSync(join(unitDir, "gitstats-sync.timer"), `[Unit]\nDescription=gitstats daily sync\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n`);
+    mkdirSync(UNIT_DIR, { recursive: true });
+    writeFileSync(join(UNIT_DIR, "gitstats-sync.service"), `[Unit]\nDescription=gitstats sync\n\n[Service]\nType=oneshot\nExecStart=${node} ${script} sync --quiet\n`);
+    writeFileSync(TIMER, `[Unit]\nDescription=gitstats daily sync\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n`);
     spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
     spawnSync("systemctl", ["--user", "enable", "--now", "gitstats-sync.timer"], { stdio: "ignore" });
     return "systemd user timer gitstats-sync (daily, catches up if missed)";
@@ -502,17 +530,16 @@ function installSchedule() {
 function removeSchedule() {
     const os = platform();
     if (os === "darwin") {
-        const plist = join(HOME, "Library", "LaunchAgents", "com.gitstats.sync.plist");
-        spawnSync("launchctl", ["unload", plist], { stdio: "ignore" });
-        rmSync(plist, { force: true });
+        spawnSync("launchctl", ["unload", PLIST], { stdio: "ignore" });
+        rmSync(PLIST, { force: true });
     }
     else if (os === "win32") {
         spawnSync("schtasks", ["/Delete", "/TN", "gitstats-sync", "/F"], { stdio: "ignore" });
     }
     else {
         spawnSync("systemctl", ["--user", "disable", "--now", "gitstats-sync.timer"], { stdio: "ignore" });
-        rmSync(join(HOME, ".config", "systemd", "user", "gitstats-sync.timer"), { force: true });
-        rmSync(join(HOME, ".config", "systemd", "user", "gitstats-sync.service"), { force: true });
+        rmSync(TIMER, { force: true });
+        rmSync(join(UNIT_DIR, "gitstats-sync.service"), { force: true });
     }
 }
 function openBrowser(url) {
@@ -609,7 +636,9 @@ async function main() {
             return sync(requireConfig(), args.includes("--quiet"));
         case "status": {
             const c = requireConfig();
-            log(`server   ${c.server}\nuser     ${c.login}\nmachine  ${c.machine}\nroots    ${c.roots.join(", ")}\nextra    ${c.repos.join(", ") || "-"}\nemails   ${c.emails.join(", ")}`);
+            // Labels are padded to the width of `last sync`, the longest one.
+            log(`server    ${c.server}\nuser      ${c.login}\nmachine   ${c.machine}\nversion   ${installedVersion()}\nroots     ${c.roots.join(", ")}\nextra     ${c.repos.join(", ") || "-"}\nemails    ${c.emails.join(", ")}`);
+            log(`schedule  ${scheduleInstalled() ? "scheduled" : "paused \u00b7 `gitstats resume` starts it again"}`);
             log(c.lastSync ? `last sync ${c.lastSync.at} · ${c.lastSync.repos} repos · ${c.lastSync.weeks} weeks${c.lastSync.error ? ` · ERROR ${c.lastSync.error}` : ""}` : "last sync never");
             return;
         }
