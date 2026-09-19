@@ -28,7 +28,10 @@ import { fileURLToPath } from "node:url";
 
 const DEFAULT_SERVER = "https://gitstats.org";
 const PKG = "@yaroslavhaidash/gitstats-cli";
-const HOME = homedir();
+/** The scheduler starts the job with its own environment, not the shell's: launchd hands an agent
+ *  the user's real home directory whatever `HOME` was when the plist was written. So the entry
+ *  carries the directory it was installed for, and without it nothing changes. */
+const HOME = process.env.GITSTATS_HOME ?? homedir();
 const DIR = join(HOME, ".gitstats");
 const CONFIG = join(DIR, "config.json");
 const SELF = join(DIR, "cli");
@@ -563,6 +566,7 @@ function installSchedule(): string {
 <plist version="1.0"><dict>
   <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key><array><string>${node}</string><string>${script}</string><string>sync</string><string>--quiet</string></array>
+  <key>EnvironmentVariables</key><dict><key>GITSTATS_HOME</key><string>${HOME}</string></dict>
   <key>StartInterval</key><integer>21600</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${join(DIR, "sync.log")}</string>
@@ -574,6 +578,8 @@ function installSchedule(): string {
     return `launchd agent ${LABEL} (every 6h, and at login)`;
   }
   if (os === "win32") {
+    // Task Scheduler runs the task as the account that registered it, so its profile is already the
+    // one this config lives under; there is no second HOME to carry.
     const ps = `$a = New-ScheduledTaskAction -Execute '${node}' -Argument '"${script}" sync --quiet'; ` +
       `$t = New-ScheduledTaskTrigger -Daily -At 12:00; ` +
       `$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -RunOnlyIfNetworkAvailable; ` +
@@ -582,7 +588,7 @@ function installSchedule(): string {
     return `Task Scheduler task ${JOB} (daily 12:00, runs late if missed)`;
   }
   mkdirSync(UNIT_DIR, { recursive: true });
-  writeFileSync(join(UNIT_DIR, `${JOB}.service`), `[Unit]\nDescription=gitstats sync\n\n[Service]\nType=oneshot\nExecStart=${node} ${script} sync --quiet\n`);
+  writeFileSync(join(UNIT_DIR, `${JOB}.service`), `[Unit]\nDescription=gitstats sync\n\n[Service]\nType=oneshot\nEnvironment=GITSTATS_HOME=${HOME}\nExecStart=${node} ${script} sync --quiet\n`);
   writeFileSync(TIMER, `[Unit]\nDescription=gitstats daily sync\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n`);
   spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
   spawnSync("systemctl", ["--user", "enable", "--now", `${JOB}.timer`], { stdio: "ignore" });
