@@ -7,6 +7,7 @@
  *                             pair this computer, scan for repos, sync, install a daily sync
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent;
  *                             --no-fetch skips the fetch, --no-update skips the daily version check)
+ *   gitstats stats            count this machine's repos and print the numbers; sends nothing, stores nothing
  *   gitstats status           what is linked, whether the background sync is scheduled, when it last ran
  *   gitstats add <path>       track a repo outside the scanned folders
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
@@ -17,7 +18,7 @@
  *   gitstats unlink           revoke this computer and remove the schedule and local config
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
 import { homedir, hostname, platform, tmpdir } from "node:os";
@@ -318,11 +319,10 @@ async function confirm(question: string): Promise<boolean> {
   return answer === "" || answer === "y" || answer === "yes";
 }
 
-function count(c: Config, since: string): { scanned: number; reports: Counted[] } {
+function count(c: Config, since: string, fetch = !args.includes("--no-fetch")): { scanned: number; reports: Counted[] } {
   const repos = findRepos(c.roots, c.repos);
   const reports: Counted[] = [];
   const seen = new Set<string>();
-  const fetch = !args.includes("--no-fetch");
   for (const r of repos) {
     // Worktrees and extra clones share a remote: fetch and count the primary clone only (they read the same origin/HEAD).
     const key = remoteInfo(r).key;
@@ -649,6 +649,48 @@ async function link(): Promise<void> {
   log(`  Commands and how to stop: ${server}/docs\n`);
 }
 
+/**
+ * What `link` would count, printed and then forgotten. It talks to git and to nothing else: no
+ * pairing, no upload, no config file, and no network unless `--fetch` is asked for. The point is
+ * that the answer to "what would this send?" can be had without having to trust the answer.
+ */
+function stats(): void {
+  const roots = args.flatMap((a, i) => (a === "--root" && args[i + 1] ? [resolve(args[i + 1]!)] : []));
+  const email = globalEmail();
+  // Never written anywhere: the salt only exists because `countRepo` hashes a remote it will not send.
+  const c: Config = {
+    server: DEFAULT_SERVER,
+    token: "",
+    salt: randomBytes(16).toString("hex"),
+    sendNames: false,
+    login: "",
+    githubId: null,
+    machine: hostname(),
+    roots: roots.length > 0 ? roots : [HOME],
+    repos: [],
+    emails: email ? [email] : [],
+  };
+  log(`  counting commits by: ${[...c.emails, "each repo's own user.email"].join(", ")}`);
+  log(`  scanning ${c.roots.join(", ")} for git repos… nothing is uploaded and no config is written\n`);
+  const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
+  const { scanned, reports } = count(c, since, args.includes("--fetch"));
+  log(`  found ${scanned} repos, ${reports.length} with your commits in the last year:\n`);
+  if (reports.length === 0) {
+    log(email ? "  nothing in the last year. Repos elsewhere? add --root /path" : "  no commit email found — set one with: git config --global user.email you@example.com");
+    return;
+  }
+  summarize(reports);
+  const all = reports.flatMap((r) => r.weeks);
+  const commits = all.reduce((n, w) => n + w.commits, 0);
+  const additions = all.reduce((n, w) => n + w.additions, 0);
+  const deletions = all.reduce((n, w) => n + w.deletions, 0);
+  const days = new Set(reports.flatMap((r) => r.days.filter((d) => d.commits > 0).map((d) => d.date))).size;
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  log(`\n  ${"total".padEnd(40)} ${String(commits).padStart(5)} commits  +${additions} −${deletions}`);
+  log(`  over ${plural(reports.length, "repo")} and ${plural(days, "active day")}, last ${DAYS} days`);
+  log(`\n  nothing was sent · run \`link\` to put this on your board`);
+}
+
 function requireConfig(): Config {
   const c = loadConfig();
   if (!c) throw new Error("not linked yet; run: npx @yaroslavhaidash/gitstats-cli@latest link");
@@ -661,6 +703,8 @@ async function main(): Promise<void> {
       return link();
     case "sync":
       return sync(requireConfig(), args.includes("--quiet"));
+    case "stats":
+      return stats();
     case "status": {
       const c = requireConfig();
       // Labels are padded to the width of `last sync`, the longest one.
@@ -735,7 +779,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      log("usage: gitstats <link [--root <dir>]... [--yes] | sync [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
+      log("usage: gitstats <link [--root <dir>]... [--yes] | stats [--root <dir>]... [--fetch] | sync [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
   }
 }
 

@@ -2,6 +2,15 @@
 
 Counts commits and lines in the git repos on your computer and sends **only the numbers** (per repo, per week) to your [gitstats](https://gitstats.org) profile. No file contents, no diffs, no GitHub tokens, no permissions on GitHub.
 
+Not ready to sign up for anything? Start here — it pairs with nothing, uploads nothing, writes no
+config and makes no network call at all. It reads your git history, prints the table, and exits:
+
+```bash
+npx @yaroslavhaidash/gitstats-cli@latest stats
+```
+
+When you want the numbers on a board:
+
 ```bash
 npx @yaroslavhaidash/gitstats-cli@latest link
 ```
@@ -14,4 +23,4 @@ What leaves the machine, per repo: an HMAC-SHA256 of the normalised remote URL k
 
 This CLI is open source: `npx` runs the `dist/` committed in this repo, built from `src/cli.ts` — one file, under a thousand lines. Read it, or watch its traffic with a proxy.
 
-Commands: `sync` · `status` · `add <path>` · `roots add <dir>` · `emails add <email>` · `names on|off` · `update` · `unlink` (also revokes server-side). It keeps itself up to date: every sync checks npm at most once a day and installs a newer version before finishing, `sync --no-update` skips that. Config lives in `~/.gitstats/config.json` (mode 600).
+Commands: `stats` (local only, sends nothing) · `sync` · `status` · `add <path>` · `roots add <dir>` · `emails add <email>` · `names on|off` · `update` · `unlink` (also revokes server-side). It keeps itself up to date: every sync checks npm at most once a day and installs a newer version before finishing, `sync --no-update` skips that. Config lives in `~/.gitstats/config.json` (mode 600).
