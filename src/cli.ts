@@ -688,6 +688,9 @@ function stats(): void {
   const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
   log(`\n  ${"total".padEnd(40)} ${String(commits).padStart(5)} commits  +${additions} −${deletions}`);
   log(`  over ${plural(reports.length, "repo")} and ${plural(days, "active day")}, last ${DAYS} days`);
+  // The no-network default can undercount a repo whose origin is ahead of this clone. Say so
+  // rather than let the number look like the whole truth.
+  if (!args.includes("--fetch")) log(`\n  counted from what is already on disk · add --fetch to refresh each repo from its remote first`);
   log(`\n  nothing was sent · run \`link\` to put this on your board`);
 }
 
