@@ -19,7 +19,7 @@
  *   gitstats unlink           revoke this computer and remove the schedule and local config
  */
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
 import { homedir, hostname, platform, tmpdir } from "node:os";
@@ -507,29 +507,61 @@ async function selfUpdate(c: Config): Promise<number | null> {
   }
 }
 
-const PLIST = join(HOME, "Library", "LaunchAgents", "com.gitstats.sync.plist");
+/** One machine can hold several installs — a second HOME, a container, a test run. Keying the
+ *  scheduler entry on the config directory keeps each one to its own job: before 0.3.5 every
+ *  install used the same name, so a `link` anywhere replaced the real machine's agent and an
+ *  `unlink` removed it. */
+const HASH8 = createHash("sha256").update(DIR).digest("hex").slice(0, 8);
+const LABEL = `com.gitstats.sync.${HASH8}`;
+const JOB = `gitstats-sync-${HASH8}`;
+const PLIST = join(HOME, "Library", "LaunchAgents", `${LABEL}.plist`);
 const UNIT_DIR = join(HOME, ".config", "systemd", "user");
-const TIMER = join(UNIT_DIR, "gitstats-sync.timer");
+const TIMER = join(UNIT_DIR, `${JOB}.timer`);
+/** What versions before 0.3.5 installed: one shared name for every install on the machine. */
+const LEGACY_PLIST = join(HOME, "Library", "LaunchAgents", "com.gitstats.sync.plist");
+const LEGACY_TIMER = join(UNIT_DIR, "gitstats-sync.timer");
 
 /** Whether the background sync is scheduled at all — `pause` removes the entry, `resume` puts it back. */
 function scheduleInstalled(): boolean {
   const os = platform();
-  if (os === "darwin") return existsSync(PLIST);
-  if (os === "win32") return spawnSync("schtasks", ["/Query", "/TN", "gitstats-sync"], { stdio: "ignore" }).status === 0;
-  return existsSync(TIMER);
+  if (os === "darwin") return existsSync(PLIST) || existsSync(LEGACY_PLIST);
+  if (os === "win32") return [JOB, "gitstats-sync"].some((t) => spawnSync("schtasks", ["/Query", "/TN", t], { stdio: "ignore" }).status === 0);
+  return existsSync(TIMER) || existsSync(LEGACY_TIMER);
+}
+
+/**
+ * Drop a pre-0.3.5 entry so it cannot run alongside the hashed one. On macOS and Linux the entry is
+ * a file under this HOME, so a run under another HOME finds nothing and leaves the real machine's
+ * job alone; on Windows the task belongs to the signed-in account either way.
+ */
+function removeLegacySchedule(): void {
+  const os = platform();
+  if (os === "darwin") {
+    if (!existsSync(LEGACY_PLIST)) return;
+    spawnSync("launchctl", ["unload", LEGACY_PLIST], { stdio: "ignore" });
+    rmSync(LEGACY_PLIST, { force: true });
+  } else if (os === "win32") {
+    spawnSync("schtasks", ["/Delete", "/TN", "gitstats-sync", "/F"], { stdio: "ignore" });
+  } else {
+    if (!existsSync(LEGACY_TIMER)) return;
+    spawnSync("systemctl", ["--user", "disable", "--now", "gitstats-sync.timer"], { stdio: "ignore" });
+    rmSync(LEGACY_TIMER, { force: true });
+    rmSync(join(UNIT_DIR, "gitstats-sync.service"), { force: true });
+  }
 }
 
 function installSchedule(): string {
   const script = installSelf();
   const node = process.execPath;
   const os = platform();
+  removeLegacySchedule();
   if (os === "darwin") {
     const plist = PLIST;
     mkdirSync(dirname(plist), { recursive: true });
     writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.gitstats.sync</string>
+  <key>Label</key><string>${LABEL}</string>
   <key>ProgramArguments</key><array><string>${node}</string><string>${script}</string><string>sync</string><string>--quiet</string></array>
   <key>StartInterval</key><integer>21600</integer>
   <key>RunAtLoad</key><true/>
@@ -539,22 +571,22 @@ function installSchedule(): string {
 `);
     spawnSync("launchctl", ["unload", plist], { stdio: "ignore" });
     spawnSync("launchctl", ["load", plist], { stdio: "ignore" });
-    return "launchd agent com.gitstats.sync (every 6h, and at login)";
+    return `launchd agent ${LABEL} (every 6h, and at login)`;
   }
   if (os === "win32") {
     const ps = `$a = New-ScheduledTaskAction -Execute '${node}' -Argument '"${script}" sync --quiet'; ` +
       `$t = New-ScheduledTaskTrigger -Daily -At 12:00; ` +
       `$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -RunOnlyIfNetworkAvailable; ` +
-      `Register-ScheduledTask -TaskName 'gitstats-sync' -Action $a -Trigger $t -Settings $s -Force | Out-Null`;
+      `Register-ScheduledTask -TaskName '${JOB}' -Action $a -Trigger $t -Settings $s -Force | Out-Null`;
     spawnSync("powershell", ["-NoProfile", "-Command", ps], { stdio: "ignore" });
-    return "Task Scheduler task gitstats-sync (daily 12:00, runs late if missed)";
+    return `Task Scheduler task ${JOB} (daily 12:00, runs late if missed)`;
   }
   mkdirSync(UNIT_DIR, { recursive: true });
-  writeFileSync(join(UNIT_DIR, "gitstats-sync.service"), `[Unit]\nDescription=gitstats sync\n\n[Service]\nType=oneshot\nExecStart=${node} ${script} sync --quiet\n`);
+  writeFileSync(join(UNIT_DIR, `${JOB}.service`), `[Unit]\nDescription=gitstats sync\n\n[Service]\nType=oneshot\nExecStart=${node} ${script} sync --quiet\n`);
   writeFileSync(TIMER, `[Unit]\nDescription=gitstats daily sync\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n`);
   spawnSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
-  spawnSync("systemctl", ["--user", "enable", "--now", "gitstats-sync.timer"], { stdio: "ignore" });
-  return "systemd user timer gitstats-sync (daily, catches up if missed)";
+  spawnSync("systemctl", ["--user", "enable", "--now", `${JOB}.timer`], { stdio: "ignore" });
+  return `systemd user timer ${JOB} (daily, catches up if missed)`;
 }
 
 function removeSchedule(): void {
@@ -563,12 +595,15 @@ function removeSchedule(): void {
     spawnSync("launchctl", ["unload", PLIST], { stdio: "ignore" });
     rmSync(PLIST, { force: true });
   } else if (os === "win32") {
-    spawnSync("schtasks", ["/Delete", "/TN", "gitstats-sync", "/F"], { stdio: "ignore" });
+    spawnSync("schtasks", ["/Delete", "/TN", JOB, "/F"], { stdio: "ignore" });
   } else {
-    spawnSync("systemctl", ["--user", "disable", "--now", "gitstats-sync.timer"], { stdio: "ignore" });
+    spawnSync("systemctl", ["--user", "disable", "--now", `${JOB}.timer`], { stdio: "ignore" });
     rmSync(TIMER, { force: true });
-    rmSync(join(UNIT_DIR, "gitstats-sync.service"), { force: true });
+    rmSync(join(UNIT_DIR, `${JOB}.service`), { force: true });
   }
+  // A machine that paused or unlinked before upgrading still has the old entry; leaving it behind
+  // would keep syncing after the user asked it to stop.
+  removeLegacySchedule();
 }
 
 function openBrowser(url: string): void {
