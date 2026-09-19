@@ -17,7 +17,7 @@ npx @yaroslavhaidash/gitstats-cli@latest link
 
 That pairs this computer (you confirm in the browser), scans your home folder for repos, uploads the last year, and installs a daily background sync (launchd on macOS, Task Scheduler on Windows, systemd user timer on Linux). Nothing else to remember.
 
-`link` shows you exactly what it found and asks before the first upload.
+`link` shows you exactly what it found and asks before the first upload. It confirms in whichever browser your OS calls default, so it names the account it paired as on its own line before it scans anything — and `link --user <login>` refuses the pairing outright if the browser confirmed as somebody else.
 
 What leaves the machine, per repo: an HMAC-SHA256 of the normalised remote URL keyed with a per-user secret the server issued at pairing (so the same repo from two of your machines counts once, and public repos the server already knows are recognised without sending their name), a guessed main language, `{week, additions, deletions, commits}` and `{date, additions, deletions, commits}` for your commits (`git log --no-merges --fixed-strings --author=<your emails>` on the default branch, exact email match, weeks bucketed Sunday 00:00 UTC), and the same two shapes again under `pending` for work sitting on branches the default branch has not taken in yet. Repo names are **not** sent unless you run `gitstats names on`. Honest limit: the HMAC key lives on the server, so the server could confirm a guess about a specific URL; it cannot enumerate your repos from the hashes.
 

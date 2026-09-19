@@ -5,6 +5,7 @@
  *
  *   npx @yaroslavhaidash/gitstats-cli@latest link
  *                             pair this computer, scan for repos, sync, install a daily sync
+ *                             (--user <login> refuses the pairing if the browser confirms as someone else)
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent;
  *                             --no-fetch skips the fetch, --no-update skips the daily version check)
  *   gitstats stats            count this machine's repos and print the numbers; sends nothing, stores nothing
@@ -548,15 +549,19 @@ function openBrowser(url) {
     spawnSync(bin, a, { stdio: "ignore" });
 }
 // ---------- commands ----------
-async function revokeOnServer(c) {
-    const res = await fetch(`${c.server}/api/cli/unlink`, { method: "DELETE", headers: { Authorization: `Bearer ${c.token}` } }).catch(() => null);
+async function revokeOnServer(server, token) {
+    const res = await fetch(`${server}/api/cli/unlink`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }).catch(() => null);
     return res?.ok ?? false;
 }
 async function link() {
     const server = (args.includes("--server") ? args[args.indexOf("--server") + 1] : undefined) ?? DEFAULT_SERVER;
+    const expect = args.includes("--user") ? args[args.indexOf("--user") + 1] : undefined;
+    log(`\n  Pairing with ${server}. The browser will ask you to confirm as the GitHub account you are signed in with there.`);
+    if (expect)
+        log(`  Expecting ${expect}; anything else is refused.`);
     const previous = loadConfig();
     if (previous) {
-        log(`  this computer is already linked as ${previous.login}; replacing the link${(await revokeOnServer(previous)) ? " (old one revoked)" : ""}`);
+        log(`  this computer is already linked as ${previous.login}; replacing the link${(await revokeOnServer(previous.server, previous.token)) ? " (old one revoked)" : ""}`);
     }
     const machine = hostname();
     const start = await post(server, "/api/cli/device", { machine });
@@ -579,6 +584,13 @@ async function link() {
     }
     if (!done)
         throw new Error("timed out waiting for confirmation");
+    log(`\n  linked as ${done.login}`);
+    // The browser may have been signed in as somebody else entirely; `--user` is the only way to say
+    // up front whose board this machine belongs on, so a mismatch revokes rather than reports.
+    if (expect && expect.toLowerCase() !== done.login.toLowerCase()) {
+        const revoked = await revokeOnServer(server, done.token);
+        throw new Error(`confirmed as ${done.login}, not ${expect} — nothing was linked${revoked ? " and the pairing was revoked" : "; revoke this computer on the settings page"}. Sign in as ${expect} in the browser, then run link again.`);
+    }
     const emails = new Set();
     const ge = globalEmail();
     if (ge)
@@ -599,7 +611,7 @@ async function link() {
         emails: [...emails],
     };
     saveConfig(c);
-    log(`  linked as ${done.login} · counting commits by: ${[...emails].join(", ") || "(no email found; run: gitstats emails add you@example.com)"}`);
+    log(`  counting commits by: ${[...emails].join(", ") || "(no email found; run: gitstats emails add you@example.com)"}`);
     log(`  scanning ${c.roots.join(", ")} for git repos… (this first run can take a minute)\n`);
     const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
     const { scanned, reports } = count(c, since);
@@ -754,13 +766,13 @@ async function main() {
             const c = loadConfig();
             removeSchedule();
             if (c)
-                log((await revokeOnServer(c)) ? "revoked on the server" : "could not reach the server; revoke this computer on the settings page");
+                log((await revokeOnServer(c.server, c.token)) ? "revoked on the server" : "could not reach the server; revoke this computer on the settings page");
             rmSync(DIR, { recursive: true, force: true });
             log("unlinked");
             return;
         }
         default:
-            log("usage: gitstats <link [--root <dir>]... [--yes] | stats [--root <dir>]... [--fetch] | sync [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
+            log("usage: gitstats <link [--user <login>] [--root <dir>]... [--yes] | stats [--root <dir>]... [--fetch] | sync [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
     }
 }
 main().catch((e) => {
