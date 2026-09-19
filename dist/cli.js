@@ -23,7 +23,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFi
 import { homedir, hostname, platform, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-const DEFAULT_SERVER = "https://gitstats-three-zeta.vercel.app";
+const DEFAULT_SERVER = "https://gitstats.org";
 const PKG = "@yaroslavhaidash/gitstats-cli";
 const HOME = homedir();
 const DIR = join(HOME, ".gitstats");

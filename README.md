@@ -1,6 +1,6 @@
 # gitstats-cli
 
-Counts commits and lines in the git repos on your computer and sends **only the numbers** (per repo, per week) to your [gitstats](https://gitstats-three-zeta.vercel.app) profile. No file contents, no diffs, no GitHub tokens, no permissions on GitHub.
+Counts commits and lines in the git repos on your computer and sends **only the numbers** (per repo, per week) to your [gitstats](https://gitstats.org) profile. No file contents, no diffs, no GitHub tokens, no permissions on GitHub.
 
 ```bash
 npx @yaroslavhaidash/gitstats-cli@latest link
