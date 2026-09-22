@@ -9,6 +9,8 @@ config and makes no network call at all. It reads your git history, prints the t
 npx @yaroslavhaidash/gitstats-cli@latest stats
 ```
 
+Run it before `link`, with no account. `--root <dir>` and `--email <addr>` (both repeatable) pick where to look and whose commits count; `--fetch` refreshes each repo from its remote first.
+
 When you want the numbers on a board:
 
 ```bash

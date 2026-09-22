@@ -9,6 +9,7 @@
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent;
  *                             --no-fetch skips the fetch, --no-update skips the daily version check)
  *   gitstats stats            count this machine's repos and print the numbers; sends nothing, stores nothing
+ *                             (--root <dir> and --email <addr>, both repeatable; --fetch refreshes remotes first)
  *   gitstats status           what is linked, whether the background sync is scheduled, when it last ran
  *   gitstats add <path>       track a repo outside the scanned folders
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
@@ -685,7 +686,10 @@ async function link() {
  */
 function stats() {
     const roots = args.flatMap((a, i) => (a === "--root" && args[i + 1] ? [resolve(args[i + 1])] : []));
-    const email = globalEmail();
+    const given = args.flatMap((a, i) => (a === "--email" && args[i + 1] ? [args[i + 1]] : []));
+    // `link` also counts the GitHub noreply address, but that needs the account id a pairing returns.
+    const global = globalEmail();
+    const emails = given.length > 0 ? given : global ? [global] : [];
     // Never written anywhere: the salt only exists because `countRepo` hashes a remote it will not send.
     const c = {
         server: DEFAULT_SERVER,
@@ -697,7 +701,7 @@ function stats() {
         machine: hostname(),
         roots: roots.length > 0 ? roots : [HOME],
         repos: [],
-        emails: email ? [email] : [],
+        emails,
     };
     log(`  counting commits by: ${[...c.emails, "each repo's own user.email"].join(", ")}`);
     log(`  scanning ${c.roots.join(", ")} for git repos… nothing is uploaded and no config is written\n`);
@@ -705,7 +709,7 @@ function stats() {
     const { scanned, reports } = count(c, since, args.includes("--fetch"));
     log(`  found ${scanned} repos, ${reports.length} with your commits in the last year:\n`);
     if (reports.length === 0) {
-        log(email ? "  nothing in the last year. Repos elsewhere? add --root /path" : "  no commit email found — set one with: git config --global user.email you@example.com");
+        log(emails.length > 0 ? "  nothing in the last year. Repos elsewhere? add --root /path" : "  no commit email found — pass --email you@example.com");
         return;
     }
     summarize(reports);
@@ -715,13 +719,8 @@ function stats() {
     const deletions = all.reduce((n, w) => n + w.deletions, 0);
     const days = new Set(reports.flatMap((r) => r.days.filter((d) => d.commits > 0).map((d) => d.date))).size;
     const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
-    log(`\n  ${"total".padEnd(40)} ${String(commits).padStart(5)} commits  +${additions} −${deletions}`);
-    log(`  over ${plural(reports.length, "repo")} and ${plural(days, "active day")}, last ${DAYS} days`);
-    // The no-network default can undercount a repo whose origin is ahead of this clone. Say so
-    // rather than let the number look like the whole truth.
-    if (!args.includes("--fetch"))
-        log(`\n  counted from what is already on disk · add --fetch to refresh each repo from its remote first`);
-    log(`\n  nothing was sent · run \`link\` to put this on your board`);
+    log(`\n  last ${DAYS} days: ${plural(commits, "commit")}, +${additions} −${deletions} lines, ${plural(reports.length, "repo")}, ${plural(days, "active day")}`);
+    log(`  nothing was sent · after \`link\` these numbers go to your page on ${DEFAULT_SERVER.replace("https://", "")}`);
 }
 function requireConfig() {
     const c = loadConfig();
