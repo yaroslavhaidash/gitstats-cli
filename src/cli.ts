@@ -441,32 +441,40 @@ function isNewer(candidate: string, current: string): boolean {
   return false;
 }
 
+/** The registry's record for the latest published version. */
+async function latestMeta(): Promise<Record<string, unknown>> {
+  const res = await fetch(REGISTRY, { signal: AbortSignal.timeout(5000) });
+  if (!res.ok) throw new Error(`registry answered ${res.status}`);
+  const meta: unknown = await res.json();
+  if (typeof meta !== "object" || meta === null) throw new Error("registry sent no metadata");
+  return meta as Record<string, unknown>;
+}
+
 /**
  * Replace ~/.gitstats/cli with the latest published package. The schedule points at an absolute
  * path inside it and the config lives beside it, so neither is touched.
+ * No npm: the scheduler starts the job with a minimal PATH that has node (by absolute path) but
+ * not npm, so the tarball is fetched directly and checked against the registry's sha512 integrity.
  */
-function update(): void {
+async function update(meta: Record<string, unknown>): Promise<void> {
   const before = installedVersion();
+  const dist = typeof meta.dist === "object" && meta.dist !== null ? (meta.dist as Record<string, unknown>) : {};
+  const { tarball, integrity } = dist;
+  if (typeof tarball !== "string" || typeof integrity !== "string" || !integrity.startsWith("sha512-")) {
+    throw new Error("registry sent no tarball or sha512 integrity");
+  }
+  const res = await fetch(tarball, { signal: AbortSignal.timeout(120_000) });
+  if (!res.ok) throw new Error(`could not download ${PKG}@${String(meta.version)} — registry answered ${res.status}`);
+  const bytes = Buffer.from(await res.arrayBuffer());
+  if (createHash("sha512").update(bytes).digest("base64") !== integrity.slice("sha512-".length)) {
+    throw new Error("the download does not match the registry's integrity hash; nothing was changed");
+  }
   const tmp = mkdtempSync(join(tmpdir(), "gitstats-update-"));
   try {
-    const pack = spawnSync("npm", ["pack", `${PKG}@latest`, "--pack-destination", tmp], {
-      encoding: "utf8",
-      timeout: 120_000,
-      shell: platform() === "win32",
-    });
-    if (pack.status !== 0) {
-      // npm says why far better than we could (404, offline, proxy); its last line is just a log path.
-      const why =
-        (pack.stderr ?? "")
-          .split("\n")
-          .map((l) => l.replace(/^npm (error|ERR!)\s*/, "").trim())
-          .find((l) => l.length > 0 && !l.startsWith("A complete log")) ?? "is npm on PATH?";
-      throw new Error(`could not download ${PKG}@latest — ${why}`);
-    }
-    const tgz = readdirSync(tmp).find((f) => f.endsWith(".tgz"));
-    if (!tgz) throw new Error("npm pack downloaded nothing");
-    // Unpack first: only replace the installed copy once we know the download is good.
-    const untar = spawnSync("tar", ["-xzf", join(tmp, tgz), "-C", tmp], { timeout: 60_000 });
+    writeFileSync(join(tmp, "package.tgz"), bytes);
+    // Unpack first: only replace the installed copy once we know the download is good. Relative names
+    // under cwd, because GNU tar (Git for Windows) reads "C:\..." as a remote host.
+    const untar = spawnSync("tar", ["-xzf", "package.tgz"], { cwd: tmp, timeout: 60_000 });
     if (untar.status !== 0) throw new Error("could not unpack the download (is tar available?)");
     const root = join(tmp, "package");
     if (!existsSync(join(root, "dist", "cli.js"))) throw new Error("the published package has no dist/cli.js");
@@ -496,13 +504,10 @@ async function selfUpdate(c: Config): Promise<number | null> {
   saveConfig(c);
   const current = runningVersion();
   try {
-    const res = await fetch(REGISTRY, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) throw new Error(`registry answered ${res.status}`);
-    const meta: unknown = await res.json();
-    const latest = typeof meta === "object" && meta !== null ? (meta as Record<string, unknown>).version : null;
-    if (typeof latest !== "string") throw new Error("registry sent no version");
-    if (!isNewer(latest, current)) return null;
-    update();
+    const meta = await latestMeta();
+    if (typeof meta.version !== "string") throw new Error("registry sent no version");
+    if (!isNewer(meta.version, current)) return null;
+    await update(meta);
     const fresh = spawnSync(process.execPath, [join(SELF, "dist", "cli.js"), "sync", "--quiet"], { stdio: "inherit" });
     return fresh.status ?? 1;
   } catch (e) {
@@ -824,7 +829,7 @@ async function main(): Promise<void> {
       return;
     case "update":
       requireConfig();
-      return update();
+      return update(await latestMeta());
     case "unlink": {
       const c = loadConfig();
       removeSchedule();

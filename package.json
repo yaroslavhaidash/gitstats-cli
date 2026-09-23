@@ -1,6 +1,6 @@
 {
   "name": "@yaroslavhaidash/gitstats-cli",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Counts your commits and lines locally and sends only the numbers to your gitstats board.",
   "license": "MIT",
   "author": "Yaroslav Haidash",
