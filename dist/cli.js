@@ -331,6 +331,8 @@ function count(c, since, fetch = !args.includes("--no-fetch"), history = false, 
     if (full > 0 && progress)
         log(`  counting full history for ${full} repos (once)`);
     const reports = [];
+    /** Counted in full and none of it yours: done too, or it would be counted in full on every sync. */
+    const nothingOld = [];
     let done = 0;
     for (const r of primary) {
         const historyFrom = history && !sent.has(remoteHash(c.salt, r.key)) ? HISTORY_FROM : null;
@@ -339,8 +341,10 @@ function count(c, since, fetch = !args.includes("--no-fetch"), history = false, 
         const rep = countRepo(r.path, c.emails, since, c.salt, c.sendNames, fetch, historyFrom);
         if (rep)
             reports.push(rep);
+        else if (historyFrom)
+            nothingOld.push(remoteHash(c.salt, r.key));
     }
-    return { scanned: repos.length, reports };
+    return { scanned: repos.length, reports, nothingOld };
 }
 /** Full-history repos in request-sized groups, packed in order. One repo alone always fits the server's per-repo cap. */
 function packHistory(reports) {
@@ -372,7 +376,7 @@ async function send(c, reports) {
  * further requests, and a repo joins `historySent` only once its request returned 200, so a failed
  * one is counted and sent again next time. Re-sending a history replaces the same rows.
  */
-async function upload(c, reports) {
+async function upload(c, reports, nothingOld = []) {
     const { status, body } = await send(c, reports.filter((r) => !r.since));
     if (status !== 200 || !body) {
         c.lastSync = { at: new Date().toISOString(), repos: 0, weeks: 0, error: `server answered ${status}` };
@@ -398,6 +402,8 @@ async function upload(c, reports) {
         c.historySent = [...new Set([...(c.historySent ?? []), ...group.map((r) => r.remoteHash)])];
         saveConfig(c);
     }
+    if (!error)
+        c.historySent = [...new Set([...(c.historySent ?? []), ...nothingOld])];
     c.lastSync = { at: new Date().toISOString(), repos: total.repos, weeks: total.weeks, ...(error ? { error } : {}) };
     saveConfig(c);
     if (groups.length > 0) {
@@ -414,8 +420,8 @@ async function sync(c, quiet = false) {
         saveConfig(c);
     }
     const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
-    const { scanned, reports } = count(c, since, !args.includes("--no-fetch"), true, !quiet);
-    const body = await upload(c, reports);
+    const { scanned, reports, nothingOld } = count(c, since, !args.includes("--no-fetch"), true, !quiet);
+    const body = await upload(c, reports, nothingOld);
     if (!quiet) {
         const full = reports.filter((r) => r.since).length;
         log(`scanned ${scanned} repos, ${reports.length} with your commits${full > 0 ? ` (${full} counted in full, once)` : " in the last year"}, ${body.weeks} weekly rows sent in ${body.requests} request${body.requests === 1 ? "" : "s"}`);
@@ -751,7 +757,7 @@ async function link() {
     log(`  counting commits by: ${[...emails].join(", ") || "(no email found; run: gitstats emails add you@example.com)"}`);
     log(`  scanning ${c.roots.join(", ")} for git repos… (this first run can take a minute)\n`);
     const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
-    const { scanned, reports } = count(c, since, !args.includes("--no-fetch"), true, true);
+    const { scanned, reports, nothingOld } = count(c, since, !args.includes("--no-fetch"), true, true);
     log(`  found ${scanned} repos, ${reports.length} with your commits (each one's full history this first time):`);
     summarize(reports);
     log(`\n  What gets sent per repo: a keyed hash of its remote URL, the language guess, the weekly numbers above, and commits-per-day counts.`);
@@ -761,7 +767,7 @@ async function link() {
         log("  cancelled; nothing was uploaded and the link was removed locally (revoke it on the settings page).");
         return;
     }
-    const body = await upload(c, reports);
+    const body = await upload(c, reports, nothingOld);
     log(`  uploaded ${body.weeks} weekly rows for ${body.repos} repos in ${body.requests} request${body.requests === 1 ? "" : "s"}${body.historyLeft > 0 ? `; ${body.historyLeft} full histories were not accepted and go with the next sync` : ""}`);
     const how = installSchedule();
     log(`\n  scheduled: ${how}`);
