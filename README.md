@@ -17,7 +17,7 @@ When you want the numbers on a board:
 npx @yaroslavhaidash/gitstats-cli@latest link
 ```
 
-That pairs this computer (you confirm in the browser), scans your home folder for repos, uploads the last year, and installs a daily background sync (launchd on macOS, Task Scheduler on Windows, systemd user timer on Linux). Nothing else to remember.
+That pairs this computer (you confirm in the browser), scans your home folder for repos, uploads each repo's full history once (every later sync recounts the last year), and installs a daily background sync (launchd on macOS, Task Scheduler on Windows, systemd user timer on Linux). Nothing else to remember.
 
 `link` shows you exactly what it found and asks before the first upload. It confirms in whichever browser your OS calls default, so it names the account it paired as on its own line before it scans anything — and `link --user <login>` refuses the pairing outright if the browser confirmed as somebody else.
 
@@ -27,4 +27,4 @@ What leaves the machine, per repo: an HMAC-SHA256 of the normalised remote URL k
 
 This CLI is open source: `npx` runs the `dist/` committed in this repo, built from `src/cli.ts` — one file, under a thousand lines. Read it, or watch its traffic with a proxy.
 
-Commands: `stats` (local only, sends nothing) · `sync` · `status` · `add <path>` · `roots add <dir>` · `emails add <email>` · `names on|off` · `update` · `unlink` (also revokes server-side). It keeps itself up to date: every sync checks npm at most once a day and installs a newer version before finishing, `sync --no-update` skips that. Config lives in `~/.gitstats/config.json` (mode 600).
+Commands: `stats` (local only, sends nothing) · `sync` (`--history` recounts every repo in full) · `status` · `add <path>` · `roots add <dir>` · `emails add <email>` · `names on|off` · `update` · `unlink` (also revokes server-side). It keeps itself up to date: every sync checks npm at most once a day and installs a newer version before finishing, `sync --no-update` skips that. Config lives in `~/.gitstats/config.json` (mode 600).

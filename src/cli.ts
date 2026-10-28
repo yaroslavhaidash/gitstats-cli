@@ -7,7 +7,9 @@
  *                             pair this computer, scan for repos, sync, install a daily sync
  *                             (--user <login> refuses the pairing if the browser confirms as someone else)
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent;
- *                             --no-fetch skips the fetch, --no-update skips the daily version check)
+ *                             a repo seen for the first time is counted in full once; --history recounts
+ *                             every repo in full; --no-fetch skips the fetch, --no-update skips the daily
+ *                             version check)
  *   gitstats stats            count this machine's repos and print the numbers; sends nothing, stores nothing
  *                             (--root <dir> and --email <addr>, both repeatable; --fetch refreshes remotes first)
  *   gitstats status           what is linked, whether the background sync is scheduled, when it last ran
@@ -37,6 +39,12 @@ const DIR = join(HOME, ".gitstats");
 const CONFIG = join(DIR, "config.json");
 const SELF = join(DIR, "cli");
 const DAYS = 365;
+/** The server's floor for a full history: commits dated earlier are not counted. */
+const HISTORY_FROM = "2000-01-01";
+/** What the server accepts in one request; a full history is split into requests under these. */
+const MAX_REQUEST_REPOS = 500;
+const MAX_REQUEST_WEEKS = 5_000;
+const MAX_REQUEST_DAYS = 20_000;
 const PENDING_DAYS = 30;
 const SYNC_LOG = join(DIR, "sync.log");
 const UPDATE_EVERY_MS = 24 * 60 * 60 * 1000;
@@ -58,13 +66,16 @@ type Config = {
   lastSync?: { at: string; repos: number; weeks: number; error?: string };
   /** When the registry was last asked for a newer version; the check runs at most once a day. */
   lastUpdateCheck?: string;
+  /** Remote hashes whose full history this machine has uploaded. Never sent. */
+  historySent?: string[];
 };
 
 type Week = { weekStart: string; additions: number; deletions: number; commits: number };
 type Day = { date: string; additions: number; deletions: number; commits: number };
 /** Work sitting on a branch that has not reached the default branch yet. Never ranked, only shown. */
 type Buckets = { weeks: Week[]; days: Day[] };
-type RepoReport = { remoteHash: string; name: string | null; language: string | null; weeks: Week[]; days: Day[]; pending: Buckets };
+/** `since` only on a full-history upload: the server then replaces that repo's whole series from it. */
+type RepoReport = { remoteHash: string; name: string | null; language: string | null; weeks: Week[]; days: Day[]; pending: Buckets; since?: string };
 type Counted = RepoReport & { path: string; label: string; isWorktree: boolean };
 
 const args = process.argv.slice(2);
@@ -258,7 +269,12 @@ function buckets(t: Tally): Buckets {
 
 const EMPTY_TALLY: () => Tally = () => ({ weeks: new Map(), days: new Map(), langLines: new Map() });
 
-function countRepo(repo: string, emails: string[], since: string, salt: string, sendNames: boolean, fetch: boolean): Counted | null {
+function remoteHash(salt: string, key: string): string {
+  return createHmac("sha256", salt).update(key).digest("hex");
+}
+
+/** `historyFrom` counts the default branch from that day instead of `since`; pending work stays at `since`. */
+function countRepo(repo: string, emails: string[], since: string, salt: string, sendNames: boolean, fetch: boolean, historyFrom: string | null = null): Counted | null {
   const info = remoteInfo(repo);
   const localEmail = git(repo, "config", "user.email")?.trim();
   const all = [...new Set([...emails, ...(localEmail ? [localEmail] : [])])].filter(Boolean);
@@ -266,23 +282,24 @@ function countRepo(repo: string, emails: string[], since: string, salt: string, 
   const ref = defaultRef(repo);
   if (fetch) refresh(repo, ref);
   // --fixed-strings: emails like 123+login@users.noreply.github.com would otherwise be read as regex.
-  const common = ["--no-merges", "--fixed-strings", `--since=${since}`, "--numstat", "--date=iso-strict", "--format=%x1e%H%x1f%aI%x1f%ae"];
+  const common = ["--no-merges", "--fixed-strings", "--numstat", "--date=iso-strict", "--format=%x1e%H%x1f%aI%x1f%ae"];
   const authors = all.map((e) => `--author=${e}`);
-  const out = git(repo, "log", ref, ...common, ...authors);
+  const out = git(repo, "log", ref, `--since=${historyFrom ?? since}`, ...common, ...authors);
   if (out === null) return null;
   const unmerged = pendingRefs(repo, ref);
-  const pendingOut = unmerged.length > 0 ? git(repo, "log", ...unmerged, "--not", ref, ...common, ...authors) : null;
+  const pendingOut = unmerged.length > 0 ? git(repo, "log", ...unmerged, "--not", ref, `--since=${since}`, ...common, ...authors) : null;
   const merged = tally(out, all);
   const pending = pendingOut === null ? EMPTY_TALLY() : tally(pendingOut, all);
   if (merged.weeks.size === 0 && pending.weeks.size === 0) return null;
   const langLines = merged.langLines.size > 0 ? merged.langLines : pending.langLines;
   const language = [...langLines.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? null;
   return {
-    remoteHash: createHmac("sha256", salt).update(info.key).digest("hex"),
+    remoteHash: remoteHash(salt, info.key),
     name: sendNames ? info.label : null,
     language,
     ...buckets(merged),
     pending: buckets(pending),
+    ...(historyFrom ? { since: historyFrom } : {}),
     path: repo,
     label: info.label,
     isWorktree: isWorktree(repo),
@@ -313,7 +330,7 @@ function summarize(reports: Counted[]): void {
     const d = r.weeks.reduce((n, w) => n + w.deletions, 0);
     const cm = r.weeks.reduce((n, w) => n + w.commits, 0);
     const pending = r.pending.weeks.reduce((n, w) => n + w.commits, 0);
-    log(`  ${r.label.padEnd(40)} ${String(cm).padStart(5)} commits  +${a} −${d}${pending > 0 ? `  (${pending} pending)` : ""}`);
+    log(`  ${r.label.padEnd(40)} ${String(cm).padStart(5)} commits  +${a} −${d}${pending > 0 ? `  (${pending} pending)` : ""}${r.since ? "  (full history)" : ""}`);
   }
 }
 
@@ -324,48 +341,114 @@ async function confirm(question: string): Promise<boolean> {
   return answer === "" || answer === "y" || answer === "yes";
 }
 
-function count(c: Config, since: string, fetch = !args.includes("--no-fetch")): { scanned: number; reports: Counted[] } {
+/**
+ * `history` counts every repo whose full history this machine has not uploaded yet from
+ * HISTORY_FROM, once; the rest get the last year, as always. `progress` names each of those repos as
+ * it goes, for `link`, where the first count can take minutes.
+ */
+function count(c: Config, since: string, fetch = !args.includes("--no-fetch"), history = false, progress = false): { scanned: number; reports: Counted[] } {
   const repos = findRepos(c.roots, c.repos);
-  const reports: Counted[] = [];
+  // Worktrees and extra clones share a remote: fetch and count the primary clone only (they read the same origin/HEAD).
+  const primary: { path: string; key: string; label: string }[] = [];
   const seen = new Set<string>();
   for (const r of repos) {
-    // Worktrees and extra clones share a remote: fetch and count the primary clone only (they read the same origin/HEAD).
-    const key = remoteInfo(r).key;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const rep = countRepo(r, c.emails, since, c.salt, c.sendNames, fetch);
+    const info = remoteInfo(r);
+    if (seen.has(info.key)) continue;
+    seen.add(info.key);
+    primary.push({ path: r, ...info });
+  }
+  const sent = new Set(c.historySent ?? []);
+  const full = history ? primary.filter((r) => !sent.has(remoteHash(c.salt, r.key))).length : 0;
+  if (full > 0 && progress) log(`  counting full history for ${full} repos (once)`);
+  const reports: Counted[] = [];
+  let done = 0;
+  for (const r of primary) {
+    const historyFrom = history && !sent.has(remoteHash(c.salt, r.key)) ? HISTORY_FROM : null;
+    if (historyFrom && progress) log(`  [${++done}/${full}] ${r.label}`);
+    const rep = countRepo(r.path, c.emails, since, c.salt, c.sendNames, fetch, historyFrom);
     if (rep) reports.push(rep);
   }
   return { scanned: repos.length, reports };
 }
 
-async function upload(c: Config, reports: Counted[]): Promise<{ repos: number; weeks: number }> {
-  const payload = reports.map(({ remoteHash, name, language, weeks, days, pending }) => ({ remoteHash, name, language, weeks, days, pending }));
-  const { status, body } = await post<{ repos: number; weeks: number; outdated?: boolean; minVersion?: string }>(
-    c.server,
-    "/api/ingest",
-    { cliVersion: runningVersion(), repos: payload },
-    c.token,
-  );
+/** Full-history repos in request-sized groups, packed in order. One repo alone always fits the server's per-repo cap. */
+function packHistory(reports: Counted[]): Counted[][] {
+  const groups: Counted[][] = [];
+  let group: Counted[] = [];
+  let weeks = 0;
+  let days = 0;
+  for (const r of reports) {
+    if (group.length > 0 && (group.length >= MAX_REQUEST_REPOS || weeks + r.weeks.length > MAX_REQUEST_WEEKS || days + r.days.length > MAX_REQUEST_DAYS)) {
+      groups.push(group);
+      group = [];
+      weeks = 0;
+      days = 0;
+    }
+    group.push(r);
+    weeks += r.weeks.length;
+    days += r.days.length;
+  }
+  if (group.length > 0) groups.push(group);
+  return groups;
+}
+
+async function send(c: Config, reports: Counted[]): Promise<{ status: number; body: { repos: number; weeks: number; outdated?: boolean; minVersion?: string } | null }> {
+  const payload = reports.map(({ remoteHash, name, language, weeks, days, pending, since }) => ({ remoteHash, name, language, weeks, days, pending, ...(since ? { since } : {}) }));
+  return post(c.server, "/api/ingest", { cliVersion: runningVersion(), repos: payload }, c.token);
+}
+
+/**
+ * The first request carries the last-year repos, exactly as before 0.4.0. Full histories follow in
+ * further requests, and a repo joins `historySent` only once its request returned 200, so a failed
+ * one is counted and sent again next time. Re-sending a history replaces the same rows.
+ */
+async function upload(c: Config, reports: Counted[]): Promise<{ repos: number; weeks: number; requests: number; history: number; historyLeft: number }> {
+  const { status, body } = await send(c, reports.filter((r) => !r.since));
   if (status !== 200 || !body) {
     c.lastSync = { at: new Date().toISOString(), repos: 0, weeks: 0, error: `server answered ${status}` };
     saveConfig(c);
     throw new Error(status === 401 ? "this computer is no longer linked; run `gitstats link` again" : `sync failed: HTTP ${status}`);
   }
-  c.lastSync = { at: new Date().toISOString(), repos: body.repos, weeks: body.weeks };
-  saveConfig(c);
   if (body.outdated) log(`this computer runs ${runningVersion()}; the board expects ${body.minVersion} or newer — run \`gitstats update\``);
-  return body;
+  const total = { repos: body.repos, weeks: body.weeks, requests: 1, history: 0, historyLeft: 0 };
+  const groups = packHistory(reports.filter((r) => r.since));
+  let error: string | undefined;
+  for (const [i, group] of groups.entries()) {
+    const res = await send(c, group);
+    total.requests += 1;
+    if (res.status !== 200 || !res.body) {
+      error = `full history: server answered ${res.status}`;
+      total.historyLeft = groups.slice(i).reduce((n, g) => n + g.length, 0);
+      break;
+    }
+    total.repos += res.body.repos;
+    total.weeks += res.body.weeks;
+    total.history += group.length;
+    c.historySent = [...new Set([...(c.historySent ?? []), ...group.map((r) => r.remoteHash)])];
+    saveConfig(c);
+  }
+  c.lastSync = { at: new Date().toISOString(), repos: total.repos, weeks: total.weeks, ...(error ? { error } : {}) };
+  saveConfig(c);
+  if (groups.length > 0) {
+    logFile(`full history: ${total.history} repos sent from ${HISTORY_FROM} in ${total.requests - 1} request${total.requests === 2 ? "" : "s"}${error ? `, ${total.historyLeft} left for the next sync (${error})` : ""}`);
+  }
+  return total;
 }
 
 async function sync(c: Config, quiet = false): Promise<void> {
   const restarted = await selfUpdate(c);
   if (restarted !== null) process.exit(restarted);
+  if (args.includes("--history")) {
+    c.historySent = [];
+    saveConfig(c);
+  }
   const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
-  const { scanned, reports } = count(c, since);
+  const { scanned, reports } = count(c, since, !args.includes("--no-fetch"), true, !quiet);
   const body = await upload(c, reports);
   if (!quiet) {
-    log(`scanned ${scanned} repos, ${reports.length} with your commits in the last year, ${body.weeks} weekly rows sent`);
+    const full = reports.filter((r) => r.since).length;
+    log(`scanned ${scanned} repos, ${reports.length} with your commits${full > 0 ? ` (${full} counted in full, once)` : " in the last year"}, ${body.weeks} weekly rows sent in ${body.requests} request${body.requests === 1 ? "" : "s"}`);
+    if (body.historyLeft > 0) log(`${body.historyLeft} full histories were not accepted (${c.lastSync?.error}); the next sync sends them again`);
     summarize(reports);
   }
 }
@@ -686,8 +769,8 @@ async function link(): Promise<void> {
   log(`  counting commits by: ${[...emails].join(", ") || "(no email found; run: gitstats emails add you@example.com)"}`);
   log(`  scanning ${c.roots.join(", ")} for git repos… (this first run can take a minute)\n`);
   const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
-  const { scanned, reports } = count(c, since);
-  log(`  found ${scanned} repos, ${reports.length} with your commits in the last year:`);
+  const { scanned, reports } = count(c, since, !args.includes("--no-fetch"), true, true);
+  log(`  found ${scanned} repos, ${reports.length} with your commits (each one's full history this first time):`);
   summarize(reports);
   log(`\n  What gets sent per repo: a keyed hash of its remote URL, the language guess, the weekly numbers above, and commits-per-day counts.`);
   log(`  Repo names are NOT sent (turn on later with: gitstats names on).`);
@@ -697,7 +780,7 @@ async function link(): Promise<void> {
     return;
   }
   const body = await upload(c, reports);
-  log(`  uploaded ${body.weeks} weekly rows for ${body.repos} repos`);
+  log(`  uploaded ${body.weeks} weekly rows for ${body.repos} repos in ${body.requests} request${body.requests === 1 ? "" : "s"}${body.historyLeft > 0 ? `; ${body.historyLeft} full histories were not accepted and go with the next sync` : ""}`);
   const how = installSchedule();
   log(`\n  scheduled: ${how}`);
   log(`  config: ${CONFIG}`);
@@ -839,7 +922,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      log("usage: gitstats <link [--user <login>] [--root <dir>]... [--yes] | stats [--root <dir>]... [--fetch] | sync [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
+      log("usage: gitstats <link [--user <login>] [--root <dir>]... [--yes] | stats [--root <dir>]... [--fetch] | sync [--history] [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
   }
 }
 
