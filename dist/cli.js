@@ -291,6 +291,11 @@ const CLAUDE_WINDOW = 7;
 const CLAUDE_MAX_SPAN = 1_000;
 const CLAUDE_MODEL = /^[a-z0-9][a-z0-9.\-]{0,63}$/;
 const CLAUDE_VERSION = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/;
+/**
+ * Effort levels in the order they are sent, replies and output per level. A reply without one, or
+ * with a level this version does not know yet, counts as "none" rather than inventing a slot.
+ */
+const CLAUDE_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"];
 function utcToday() {
     return new Date().toISOString().slice(0, 10);
 }
@@ -336,8 +341,9 @@ function claudeFiles(dir, sinceMs) {
 }
 /**
  * One transcript line, if it is a reply with usage. Only these keys are looked at: type, timestamp,
- * sessionId, version, message.id, message.model and the four message.usage counts. The message
- * content, paths and tool records are never read.
+ * sessionId, version, effort, isSidechain, message.id, message.model, the four message.usage counts
+ * and the type and id of each message.content block (to count tool calls). The text of the reply,
+ * tool names and inputs, and paths are never read.
  */
 function claudeReply(line) {
     let rec;
@@ -366,90 +372,186 @@ function claudeReply(line) {
     const cacheWrite = n(u.cache_creation_input_tokens);
     if (input + output + cacheRead + cacheWrite === 0)
         return null;
+    const tools = Array.isArray(m.content)
+        ? m.content.flatMap((b) => (isRecord(b) && b.type === "tool_use" && typeof b.id === "string" ? [b.id] : []))
+        : [];
+    const effort = CLAUDE_EFFORTS.indexOf(typeof rec.effort === "string" ? rec.effort : "none");
     return {
         id: m.id,
-        day: when.toISOString().slice(0, 10),
+        at: when.getTime(),
         model: CLAUDE_MODEL.test(model) ? model : "other",
         input,
         output,
         cacheRead,
         cacheWrite,
+        effort: effort < 0 ? 0 : effort,
+        tools,
+        sidechain: rec.isSidechain === true,
         session: typeof rec.sessionId === "string" ? rec.sessionId : null,
         version: typeof rec.version === "string" && CLAUDE_VERSION.test(rec.version) ? rec.version : null,
     };
 }
 /**
+ * A prompt the member typed, as `{ uuid, at }`. Claude Code also writes tool results, skill and
+ * hook text, command output, compaction summaries and subagent prompts as user lines; those are not
+ * messages. Since mid 2026 a typed prompt carries `origin.kind: "human"`; older lines have no origin,
+ * and there a plain text line counts unless it opens with a tag (`<command-name>`,
+ * `<local-command-stdout>`, …) or is the "[Request interrupted" marker. Only the first characters
+ * are looked at for that test; the text is never kept or sent.
+ */
+function claudeMessage(line) {
+    let rec;
+    try {
+        rec = JSON.parse(line);
+    }
+    catch {
+        return null;
+    }
+    if (!isRecord(rec) || rec.type !== "user" || typeof rec.uuid !== "string" || typeof rec.timestamp !== "string")
+        return null;
+    if (rec.isSidechain === true || rec.isMeta === true || rec.isCompactSummary === true)
+        return null;
+    const m = rec.message;
+    if (!isRecord(m))
+        return null;
+    const blocks = typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? m.content.filter(isRecord) : [];
+    if (blocks.some((b) => b.type === "tool_result"))
+        return null;
+    if (isRecord(rec.origin)) {
+        if (rec.origin.kind !== "human")
+            return null;
+    }
+    else {
+        const first = blocks.find((b) => b.type === "text" && typeof b.text === "string" && b.text.trim() !== "");
+        const head = typeof first?.text === "string" ? first.text.trimStart().slice(0, 24) : "";
+        if (head === "" || head.startsWith("<") || head.startsWith("[Request interrupted"))
+            return null;
+    }
+    const at = new Date(rec.timestamp).getTime();
+    return Number.isNaN(at) ? null : { uuid: rec.uuid, at };
+}
+const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+/**
  * Tokens per UTC day per model in `[from, to]`, from transcripts changed since `sinceMs`.
  * Claude Code writes one line per content block of a reply, each with a growing `output_tokens`, and
  * copies old replies into resumed and forked sessions, so lines are deduped by message id across
- * every file read (max per field, earliest day) before anything is added up. A session counts once,
- * on the day of its first reply in a main transcript, under that reply's model.
+ * every file read (max per field, earliest time, tool ids merged) before anything is added up. A
+ * session counts once, on the day of its first reply in a main transcript, under that reply's model.
+ * A typed message is deduped by its uuid and counts under the model of the next reply in its file
+ * (the reply that answered it), or the file's last reply when none follows; a file with no reply
+ * at all has nothing to attribute it to and it is left out.
  */
 async function countClaude(dir, from, to, sinceMs) {
     const files = claudeFiles(dir, sinceMs);
     const replies = new Map();
     const sessions = new Map();
+    const messages = new Map();
     let version = null;
     for (const f of files) {
+        // This file's messages still waiting for the reply that answers them.
+        let waiting = [];
+        let lastModel = null;
         try {
             for await (const line of lineReader({ input: createReadStream(f.path, { encoding: "utf8" }), crlfDelay: Infinity })) {
-                // The type's value is this exact string, so the cheap test cannot miss a reply.
+                // Each type's value is this exact string, so the cheap tests cannot miss a line; a tool
+                // result (most user lines, and the biggest) is dropped before parsing.
+                if (f.main && line.includes('"user"') && !line.includes('"tool_result"')) {
+                    const msg = claudeMessage(line);
+                    if (msg && !messages.has(msg.uuid))
+                        waiting.push(msg);
+                    if (msg)
+                        continue;
+                }
                 if (!line.includes('"assistant"'))
                     continue;
                 const r = claudeReply(line);
                 if (!r)
                     continue;
+                lastModel = r.model;
+                for (const w of waiting)
+                    if (!messages.has(w.uuid))
+                        messages.set(w.uuid, { at: w.at, model: r.model });
+                waiting = [];
                 const prev = replies.get(r.id);
                 if (!prev) {
-                    replies.set(r.id, { day: r.day, model: r.model, input: r.input, output: r.output, cacheRead: r.cacheRead, cacheWrite: r.cacheWrite });
+                    replies.set(r.id, { ...r, tools: new Set(r.tools) });
                 }
                 else {
                     prev.input = Math.max(prev.input, r.input);
                     prev.output = Math.max(prev.output, r.output);
                     prev.cacheRead = Math.max(prev.cacheRead, r.cacheRead);
                     prev.cacheWrite = Math.max(prev.cacheWrite, r.cacheWrite);
-                    if (r.day < prev.day)
-                        prev.day = r.day;
+                    if (r.at < prev.at)
+                        prev.at = r.at;
+                    if (prev.effort === 0)
+                        prev.effort = r.effort;
+                    if (r.sidechain)
+                        prev.sidechain = true;
+                    for (const t of r.tools)
+                        prev.tools.add(t);
                 }
+                const day = utcDay(r.at);
                 if (f.main && r.session !== null) {
                     const s = sessions.get(r.session);
-                    if (!s || r.day < s.day)
-                        sessions.set(r.session, { day: r.day, model: r.model });
+                    if (!s || day < s.day)
+                        sessions.set(r.session, { day, model: r.model });
                 }
-                if (r.version !== null && r.day >= from && r.day <= to && (version === null || isNewer(r.version, version)))
+                if (r.version !== null && day >= from && day <= to && (version === null || isNewer(r.version, version)))
                     version = r.version;
             }
         }
         catch {
             /* unreadable file, skip */
         }
+        if (lastModel !== null)
+            for (const w of waiting)
+                if (!messages.has(w.uuid))
+                    messages.set(w.uuid, { at: w.at, model: lastModel });
     }
     const rows = new Map();
     const row = (date, model) => {
         const key = `${date}\0${model}`;
         let d = rows.get(key);
-        if (!d)
-            rows.set(key, (d = { date, model, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, replies: 0, sessions: 0 }));
+        if (!d) {
+            const levels = () => CLAUDE_EFFORTS.map(() => 0);
+            d = { date, model, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, replies: 0, sessions: 0, effort: { replies: levels(), output: levels() }, toolCalls: 0, subagentTokens: 0, subagentReplies: 0, replyQuarters: [0, 0, 0, 0], messages: 0 };
+            rows.set(key, d);
+        }
         return d;
     };
     let counted = 0;
     let firstDay = null;
     for (const r of replies.values()) {
-        if (r.day < from || r.day > to)
+        const day = utcDay(r.at);
+        if (day < from || day > to)
             continue;
-        const d = row(r.day, r.model);
+        const d = row(day, r.model);
         d.input += r.input;
         d.output += r.output;
         d.cacheRead += r.cacheRead;
         d.cacheWrite += r.cacheWrite;
         d.replies += 1;
+        d.effort.replies[r.effort] = (d.effort.replies[r.effort] ?? 0) + 1;
+        d.effort.output[r.effort] = (d.effort.output[r.effort] ?? 0) + r.output;
+        d.toolCalls += r.tools.size;
+        if (r.sidechain) {
+            d.subagentTokens += r.input + r.output + r.cacheRead + r.cacheWrite;
+            d.subagentReplies += 1;
+        }
+        const q = Math.floor(new Date(r.at).getHours() / 6);
+        d.replyQuarters[q] = (d.replyQuarters[q] ?? 0) + 1;
         counted += 1;
-        if (firstDay === null || r.day < firstDay)
-            firstDay = r.day;
+        if (firstDay === null || day < firstDay)
+            firstDay = day;
     }
     for (const s of sessions.values())
         if (s.day >= from && s.day <= to)
             row(s.day, s.model).sessions += 1;
+    for (const m of messages.values()) {
+        const day = utcDay(m.at);
+        if (day >= from && day <= to)
+            row(day, m.model).messages += 1;
+    }
     const days = [...rows.values()].sort((x, y) => x.date.localeCompare(y.date) || x.model.localeCompare(y.model));
     return { files: files.length, recognised: replies.size, replies: counted, days, firstDay, version };
 }
@@ -517,15 +619,17 @@ async function claudeUpload(c) {
         const week = addDays(to, -CLAUDE_WINDOW);
         const caughtUp = cc.syncedThrough && addDays(cc.syncedThrough, -1) < week ? addDays(cc.syncedThrough, -1) : week;
         const recent = caughtUp < floor ? floor : caughtUp;
-        const scanFrom = cc.historySent ? recent : floor;
+        // 0.7.0 sends the full history once more, so the new counts reach back as far as the logs do.
+        const full = !cc.historySent || !cc.detailsSent;
+        const scanFrom = full ? floor : recent;
         if (!existsSync(join(cc.dir, "projects")))
             return fail(`claude: no Claude Code logs in ${join(cc.dir, "projects")}`);
         const n = await countClaude(cc.dir, scanFrom, to, Date.parse(`${scanFrom}T00:00:00Z`));
         if (n.files > 0 && n.recognised === 0)
             return fail(`claude: no usage recognised in ${n.files} changed files; the log format may have changed`);
-        const from = !cc.historySent && n.firstDay !== null && n.firstDay < recent ? n.firstDay : recent;
+        const from = full && n.firstDay !== null && n.firstDay < recent ? n.firstDay : recent;
         const machine = claudeMachine(c, cc);
-        logFile(`claude: ${from}..${to}${cc.historySent ? "" : " (full history)"}, ${n.files} files read, ${n.replies} replies, ${n.days.length} rows, ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        logFile(`claude: ${from}..${to}${full ? " (full history)" : ""}, ${n.files} files read, ${n.replies} replies, ${n.days.length} rows, ${((Date.now() - started) / 1000).toFixed(1)}s`);
         return { machine, from, to, ...(n.version ? { version: n.version } : {}), days: n.days };
     }
     catch (e) {
@@ -539,6 +643,7 @@ function enableClaude(prev, dir) {
         on: true,
         dir,
         historySent: same ? prev.historySent : false,
+        ...(same && prev.detailsSent ? { detailsSent: true } : {}),
         ...(same && prev.syncedThrough ? { syncedThrough: prev.syncedThrough } : {}),
         ...(prev?.fallbackId ? { fallbackId: prev.fallbackId } : {}),
         ...(prev?.serverOff ? { serverOff: true } : {}),
@@ -546,9 +651,12 @@ function enableClaude(prev, dir) {
 }
 function explainClaude(dir) {
     log(`\n  Claude Code usage reads the logs in ${join(dir, "projects")}: per reply only its model, its four token counts,`);
-    log(`  its day, its session id and the Claude Code version. Never your messages, Claude's answers, paths or project names.`);
-    log(`  What gets sent per UTC day per model: input, output, cache-read and cache-write tokens, replies and sessions,`);
-    log(`  plus a keyed hash of this computer. Message and session ids stay here. See the numbers first: gitstats claude`);
+    log(`  its time, its effort level, how many tool calls it made, whether a subagent ran it, its session id and the`);
+    log(`  Claude Code version; per prompt you typed only that it is one and when. Never your messages, Claude's answers,`);
+    log(`  tool names, paths or project names. What gets sent per UTC day per model: input, output, cache-read and`);
+    log(`  cache-write tokens, replies, sessions, replies and output per effort level, tool calls, subagent tokens and`);
+    log(`  replies, replies per 6-hour block of your local day and messages, plus a keyed hash of this computer.`);
+    log(`  Ids and times stay here. See the numbers first: gitstats claude`);
 }
 const fmt = (n) => n.toLocaleString("en-US");
 /** The last 14 days from this machine's logs, counted the way a sync counts them. No network, nothing written. */
@@ -560,24 +668,37 @@ async function claudeStatus() {
     const started = Date.now();
     const n = await countClaude(dir, from, to, Date.parse(`${from}T00:00:00Z`));
     log(`  Claude Code usage from ${join(dir, "projects")}, last 14 days (UTC) · nothing is sent\n`);
-    log(`  ${"date".padEnd(10)} ${"replies".padStart(8)} ${"sessions".padStart(8)} ${"tokens".padStart(16)} ${"output".padStart(12)}  top model`);
-    const total = { replies: 0, sessions: 0, tokens: 0, output: 0 };
+    log(`  ${"date".padEnd(10)} ${"replies".padStart(8)} ${"sessions".padStart(8)} ${"messages".padStart(8)} ${"tool calls".padStart(10)} ${"tokens".padStart(16)} ${"output".padStart(12)}  top model`);
+    const keys = ["replies", "sessions", "messages", "toolCalls", "tokens", "output", "subagentTokens"];
+    const zero = () => ({ replies: 0, sessions: 0, messages: 0, toolCalls: 0, tokens: 0, output: 0, subagentTokens: 0 });
+    const total = zero();
+    const effort = CLAUDE_EFFORTS.map(() => 0);
+    const quarters = [0, 0, 0, 0];
+    const tokens = (d) => d.input + d.output + d.cacheRead + d.cacheWrite;
     for (let day = from; day <= to; day = addDays(day, 1)) {
         const rows = n.days.filter((d) => d.date === day);
-        const tokens = (d) => d.input + d.output + d.cacheRead + d.cacheWrite;
-        const sum = { replies: 0, sessions: 0, tokens: 0, output: 0 };
+        const sum = zero();
         for (const d of rows) {
             sum.replies += d.replies;
             sum.sessions += d.sessions;
+            sum.messages += d.messages;
+            sum.toolCalls += d.toolCalls;
             sum.tokens += tokens(d);
             sum.output += d.output;
+            sum.subagentTokens += d.subagentTokens;
+            d.effort.replies.forEach((v, i) => (effort[i] = (effort[i] ?? 0) + v));
+            d.replyQuarters.forEach((v, i) => (quarters[i] = (quarters[i] ?? 0) + v));
         }
         const top = [...rows].sort((x, y) => tokens(y) - tokens(x))[0]?.model ?? "-";
-        for (const k of ["replies", "sessions", "tokens", "output"])
+        for (const k of keys)
             total[k] += sum[k];
-        log(`  ${day} ${fmt(sum.replies).padStart(8)} ${fmt(sum.sessions).padStart(8)} ${fmt(sum.tokens).padStart(16)} ${fmt(sum.output).padStart(12)}  ${top}`);
+        log(`  ${day} ${fmt(sum.replies).padStart(8)} ${fmt(sum.sessions).padStart(8)} ${fmt(sum.messages).padStart(8)} ${fmt(sum.toolCalls).padStart(10)} ${fmt(sum.tokens).padStart(16)} ${fmt(sum.output).padStart(12)}  ${top}`);
     }
-    log(`  ${"total".padEnd(10)} ${fmt(total.replies).padStart(8)} ${fmt(total.sessions).padStart(8)} ${fmt(total.tokens).padStart(16)} ${fmt(total.output).padStart(12)}`);
+    log(`  ${"total".padEnd(10)} ${fmt(total.replies).padStart(8)} ${fmt(total.sessions).padStart(8)} ${fmt(total.messages).padStart(8)} ${fmt(total.toolCalls).padStart(10)} ${fmt(total.tokens).padStart(16)} ${fmt(total.output).padStart(12)}`);
+    const share = (v, of) => (of > 0 ? `${((v / of) * 100).toFixed(1)}%` : "-");
+    log(`\n  replies by effort: ${CLAUDE_EFFORTS.map((e, i) => `${e} ${fmt(effort[i] ?? 0)}`).join(" · ")}`);
+    log(`  replies by local hour: 00-06 ${fmt(quarters[0] ?? 0)} · 06-12 ${fmt(quarters[1] ?? 0)} · 12-18 ${fmt(quarters[2] ?? 0)} · 18-24 ${fmt(quarters[3] ?? 0)}`);
+    log(`  subagents: ${share(total.subagentTokens, total.tokens)} of tokens`);
     log(`\n  ${n.files} files read in ${((Date.now() - started) / 1000).toFixed(1)}s${n.files > 0 && n.recognised === 0 ? " · no usage recognised: the log format may have changed" : ""}`);
     if (!c)
         log("  this computer is not linked yet: npx @yaroslavhaidash/gitstats-cli@latest link");
@@ -712,6 +833,7 @@ async function upload(c, reports, nothingOld = [], claude = null) {
             claudeDays = body.claude.days;
             c.claude.syncedThrough = claude.to;
             c.claude.historySent = true;
+            c.claude.detailsSent = true;
             delete c.claude.lastError;
         }
         else {
