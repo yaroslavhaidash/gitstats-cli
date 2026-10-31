@@ -5,7 +5,8 @@
  *
  *   npx @yaroslavhaidash/gitstats-cli@latest link
  *                             pair this computer, scan for repos, sync, install a daily sync
- *                             (--user <login> refuses the pairing if the browser confirms as someone else)
+ *                             (--user <login> refuses the pairing if the browser confirms as someone else;
+ *                             --claude also counts Claude Code usage without asking)
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent;
  *                             a repo seen for the first time is counted in full once; --history recounts
  *                             every repo in full; --no-fetch skips the fetch, --no-update skips the daily
@@ -17,16 +18,20 @@
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
  *   gitstats emails add <e>   attribute commits made with another email to you
  *   gitstats names on|off     also send repo names (off by default; your own page then labels private repos by hash)
+ *   gitstats claude on|off    also send Claude Code usage: tokens per UTC day per model, numbers only (off by default)
+ *   gitstats claude           print the last 14 days of Claude Code usage from this machine's logs; sends nothing
  *   gitstats pause | resume   stop / restart the background sync without unlinking
  *   gitstats update           fetch the latest published version now (sync does this on its own, once a day)
  *   gitstats unlink           revoke this computer and remove the schedule and local config
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createInterface as lineReader } from "node:readline";
 import { createInterface } from "node:readline/promises";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
+import { appendFileSync, createReadStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, rmSync, cpSync } from "node:fs";
+import type { Dirent } from "node:fs";
 import { homedir, hostname, platform, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_SERVER = "https://gitstats.org";
@@ -68,6 +73,20 @@ type Config = {
   lastUpdateCheck?: string;
   /** Remote hashes whose full history this machine has uploaded. Never sent. */
   historySent?: string[];
+  /** Claude Code usage counting; absent or `on: false` sends nothing. Never sent itself. */
+  claude?: ClaudeConfig;
+};
+
+type ClaudeConfig = {
+  on: boolean;
+  /** Claude Code's config folder, fixed at `claude on`: the scheduler does not carry CLAUDE_CONFIG_DIR. */
+  dir: string;
+  historySent: boolean;
+  /** `to` of the last window the server accepted; the next window reaches back to it. */
+  syncedThrough?: string;
+  lastError?: string;
+  /** Machine id for platforms where none can be read; kept so the machine key stays stable. */
+  fallbackId?: string;
 };
 
 type Week = { weekStart: string; additions: number; deletions: number; commits: number };
@@ -306,6 +325,288 @@ function countRepo(repo: string, emails: string[], since: string, salt: string, 
   };
 }
 
+// ---------- Claude Code usage ----------
+
+/** The server's floor: Claude Code's first public release was in 2025, an earlier date is a clock bug. */
+const CLAUDE_FROM = "2025-01-01";
+/** Days recounted on every sync, so replies written late or copied into a resumed session land. */
+const CLAUDE_WINDOW = 7;
+/** The longest window the server accepts in one upload. */
+const CLAUDE_MAX_SPAN = 1_000;
+const CLAUDE_MODEL = /^[a-z0-9][a-z0-9.\-]{0,63}$/;
+const CLAUDE_VERSION = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/;
+
+type ClaudeDay = { date: string; model: string; input: number; output: number; cacheRead: number; cacheWrite: number; replies: number; sessions: number };
+type ClaudeUpload = { machine: string; from: string; to: string; version?: string; days: ClaudeDay[] };
+type ClaudeReply = { id: string; day: string; model: string; input: number; output: number; cacheRead: number; cacheWrite: number; session: string | null; version: string | null };
+/** `recognised` counts replies on any day, for the zero guard; `replies` only those inside the window. */
+type ClaudeCount = { files: number; recognised: number; replies: number; days: ClaudeDay[]; firstDay: string | null; version: string | null };
+
+function utcToday(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addDays(day: string, n: number): string {
+  return new Date(Date.parse(`${day}T00:00:00Z`) + n * 86_400_000).toISOString().slice(0, 10);
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** Read where Claude Code itself reads; fixed into the config at `claude on` for the scheduler. */
+function defaultClaudeDir(): string {
+  return process.env.CLAUDE_CONFIG_DIR ? resolve(process.env.CLAUDE_CONFIG_DIR) : join(homedir(), ".claude");
+}
+
+/** Every transcript under `<dir>/projects`, subagents and workflows included, changed since `sinceMs`. */
+function claudeFiles(dir: string, sinceMs: number): { path: string; main: boolean }[] {
+  const root = join(dir, "projects");
+  const files: { path: string; main: boolean }[] = [];
+  const walk = (d: string) => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile() && e.name.endsWith(".jsonl")) {
+        try {
+          if (statSync(p).mtimeMs >= sinceMs) files.push({ path: p, main: !relative(root, p).split(sep).includes("subagents") });
+        } catch {
+          /* gone or unreadable, skip */
+        }
+      }
+    }
+  };
+  walk(root);
+  return files;
+}
+
+/**
+ * One transcript line, if it is a reply with usage. Only these keys are looked at: type, timestamp,
+ * sessionId, version, message.id, message.model and the four message.usage counts. The message
+ * content, paths and tool records are never read.
+ */
+function claudeReply(line: string): ClaudeReply | null {
+  let rec: unknown;
+  try {
+    rec = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRecord(rec) || rec.type !== "assistant" || typeof rec.timestamp !== "string") return null;
+  const m = rec.message;
+  if (!isRecord(m) || typeof m.id !== "string" || !isRecord(m.usage)) return null;
+  const model = typeof m.model === "string" ? m.model.toLowerCase() : "";
+  if (model === "<synthetic>") return null;
+  const when = new Date(rec.timestamp);
+  if (Number.isNaN(when.getTime())) return null;
+  const n = (x: unknown) => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? Math.floor(x) : 0);
+  const u = m.usage;
+  const input = n(u.input_tokens);
+  const output = n(u.output_tokens);
+  const cacheRead = n(u.cache_read_input_tokens);
+  const cacheWrite = n(u.cache_creation_input_tokens);
+  if (input + output + cacheRead + cacheWrite === 0) return null;
+  return {
+    id: m.id,
+    day: when.toISOString().slice(0, 10),
+    model: CLAUDE_MODEL.test(model) ? model : "other",
+    input,
+    output,
+    cacheRead,
+    cacheWrite,
+    session: typeof rec.sessionId === "string" ? rec.sessionId : null,
+    version: typeof rec.version === "string" && CLAUDE_VERSION.test(rec.version) ? rec.version : null,
+  };
+}
+
+/**
+ * Tokens per UTC day per model in `[from, to]`, from transcripts changed since `sinceMs`.
+ * Claude Code writes one line per content block of a reply, each with a growing `output_tokens`, and
+ * copies old replies into resumed and forked sessions, so lines are deduped by message id across
+ * every file read (max per field, earliest day) before anything is added up. A session counts once,
+ * on the day of its first reply in a main transcript, under that reply's model.
+ */
+async function countClaude(dir: string, from: string, to: string, sinceMs: number): Promise<ClaudeCount> {
+  const files = claudeFiles(dir, sinceMs);
+  const replies = new Map<string, Omit<ClaudeReply, "id" | "session" | "version">>();
+  const sessions = new Map<string, { day: string; model: string }>();
+  let version: string | null = null;
+  for (const f of files) {
+    try {
+      for await (const line of lineReader({ input: createReadStream(f.path, { encoding: "utf8" }), crlfDelay: Infinity })) {
+        // The type's value is this exact string, so the cheap test cannot miss a reply.
+        if (!line.includes('"assistant"')) continue;
+        const r = claudeReply(line);
+        if (!r) continue;
+        const prev = replies.get(r.id);
+        if (!prev) {
+          replies.set(r.id, { day: r.day, model: r.model, input: r.input, output: r.output, cacheRead: r.cacheRead, cacheWrite: r.cacheWrite });
+        } else {
+          prev.input = Math.max(prev.input, r.input);
+          prev.output = Math.max(prev.output, r.output);
+          prev.cacheRead = Math.max(prev.cacheRead, r.cacheRead);
+          prev.cacheWrite = Math.max(prev.cacheWrite, r.cacheWrite);
+          if (r.day < prev.day) prev.day = r.day;
+        }
+        if (f.main && r.session !== null) {
+          const s = sessions.get(r.session);
+          if (!s || r.day < s.day) sessions.set(r.session, { day: r.day, model: r.model });
+        }
+        if (r.version !== null && r.day >= from && r.day <= to && (version === null || isNewer(r.version, version))) version = r.version;
+      }
+    } catch {
+      /* unreadable file, skip */
+    }
+  }
+  const rows = new Map<string, ClaudeDay>();
+  const row = (date: string, model: string): ClaudeDay => {
+    const key = `${date}\0${model}`;
+    let d = rows.get(key);
+    if (!d) rows.set(key, (d = { date, model, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, replies: 0, sessions: 0 }));
+    return d;
+  };
+  let counted = 0;
+  let firstDay: string | null = null;
+  for (const r of replies.values()) {
+    if (r.day < from || r.day > to) continue;
+    const d = row(r.day, r.model);
+    d.input += r.input;
+    d.output += r.output;
+    d.cacheRead += r.cacheRead;
+    d.cacheWrite += r.cacheWrite;
+    d.replies += 1;
+    counted += 1;
+    if (firstDay === null || r.day < firstDay) firstDay = r.day;
+  }
+  for (const s of sessions.values()) if (s.day >= from && s.day <= to) row(s.day, s.model).sessions += 1;
+  const days = [...rows.values()].sort((x, y) => x.date.localeCompare(y.date) || x.model.localeCompare(y.model));
+  return { files: files.length, recognised: replies.size, replies: counted, days, firstDay, version };
+}
+
+/** The OS's own id for this computer, so the machine key survives `unlink`/`link` and renames. */
+function platformId(): string | null {
+  const run = (bin: string, a: string[]) => execFileSync(bin, a, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 });
+  try {
+    const os = platform();
+    if (os === "darwin") return /"IOPlatformUUID" = "([^"]+)"/.exec(run("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]))?.[1] ?? null;
+    if (os === "win32") return /MachineGuid\s+REG_SZ\s+(\S+)/.exec(run("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]))?.[1] ?? null;
+    for (const f of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
+      const id = existsSync(f) ? readFileSync(f, "utf8").trim() : "";
+      if (id) return id;
+    }
+  } catch {
+    /* no id readable: fall back below */
+  }
+  return null;
+}
+
+/** Keyed with the user's salt, so the server never sees the platform id or the path. */
+function claudeMachine(c: Config, cc: ClaudeConfig): string {
+  const id = platformId() ?? (cc.fallbackId ??= randomBytes(16).toString("hex"));
+  let dir = resolve(cc.dir);
+  try {
+    dir = realpathSync(cc.dir);
+  } catch {
+    /* keep the resolved path */
+  }
+  return createHmac("sha256", c.salt).update(`${id}\0${dir}`).digest("hex").slice(0, 32);
+}
+
+/**
+ * The `claude` field for the first request of a sync, or null when counting is off or nothing may be
+ * sent. The window is the last week, reaching back to the last accepted day after a gap; the first
+ * upload counts every log Claude Code still keeps and starts at its first day. The server replaces
+ * exactly `[from, to]` for this machine, so a window whose files changed but gave no reply (a log
+ * format change) is not sent at all rather than wiping counted days with zeros.
+ */
+async function claudeUpload(c: Config): Promise<ClaudeUpload | null> {
+  const cc = c.claude;
+  if (!cc?.on) return null;
+  const started = Date.now();
+  const to = utcToday();
+  const span = addDays(to, -CLAUDE_MAX_SPAN);
+  const floor = span > CLAUDE_FROM ? span : CLAUDE_FROM;
+  const fail = (msg: string): null => {
+    cc.lastError = msg;
+    logFile(msg);
+    return null;
+  };
+  try {
+    const week = addDays(to, -CLAUDE_WINDOW);
+    const caughtUp = cc.syncedThrough && addDays(cc.syncedThrough, -1) < week ? addDays(cc.syncedThrough, -1) : week;
+    const recent = caughtUp < floor ? floor : caughtUp;
+    const scanFrom = cc.historySent ? recent : floor;
+    if (!existsSync(join(cc.dir, "projects"))) return fail(`claude: no Claude Code logs in ${join(cc.dir, "projects")}`);
+    const n = await countClaude(cc.dir, scanFrom, to, Date.parse(`${scanFrom}T00:00:00Z`));
+    if (n.files > 0 && n.recognised === 0) return fail(`claude: no usage recognised in ${n.files} changed files; the log format may have changed`);
+    const from = !cc.historySent && n.firstDay !== null && n.firstDay < recent ? n.firstDay : recent;
+    const machine = claudeMachine(c, cc);
+    logFile(`claude: ${from}..${to}${cc.historySent ? "" : " (full history)"}, ${n.files} files read, ${n.replies} replies, ${n.days.length} rows, ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    return { machine, from, to, ...(n.version ? { version: n.version } : {}), days: n.days };
+  } catch (e) {
+    return fail(`claude: count failed (${e instanceof Error ? e.message : String(e)})`);
+  }
+}
+
+/** On for `dir`: the same folder keeps its progress, another one is a new machine key and starts over. */
+function enableClaude(prev: ClaudeConfig | undefined, dir: string): ClaudeConfig {
+  const same = prev?.dir === dir;
+  return {
+    on: true,
+    dir,
+    historySent: same ? prev.historySent : false,
+    ...(same && prev.syncedThrough ? { syncedThrough: prev.syncedThrough } : {}),
+    ...(prev?.fallbackId ? { fallbackId: prev.fallbackId } : {}),
+  };
+}
+
+function explainClaude(dir: string): void {
+  log(`\n  Claude Code usage reads the logs in ${join(dir, "projects")}: per reply only its model, its four token counts,`);
+  log(`  its day, its session id and the Claude Code version. Never your messages, Claude's answers, paths or project names.`);
+  log(`  What gets sent per UTC day per model: input, output, cache-read and cache-write tokens, replies and sessions,`);
+  log(`  plus a keyed hash of this computer. Message and session ids stay here. See the numbers first: gitstats claude`);
+}
+
+const fmt = (n: number) => n.toLocaleString("en-US");
+
+/** The last 14 days from this machine's logs, counted the way a sync counts them. No network, nothing written. */
+async function claudeStatus(): Promise<void> {
+  const c = loadConfig();
+  const dir = c?.claude?.dir ?? defaultClaudeDir();
+  const to = utcToday();
+  const from = addDays(to, -13);
+  const started = Date.now();
+  const n = await countClaude(dir, from, to, Date.parse(`${from}T00:00:00Z`));
+  log(`  Claude Code usage from ${join(dir, "projects")}, last 14 days (UTC) · nothing is sent\n`);
+  log(`  ${"date".padEnd(10)} ${"replies".padStart(8)} ${"sessions".padStart(8)} ${"tokens".padStart(16)} ${"output".padStart(12)}  top model`);
+  const total = { replies: 0, sessions: 0, tokens: 0, output: 0 };
+  for (let day = from; day <= to; day = addDays(day, 1)) {
+    const rows = n.days.filter((d) => d.date === day);
+    const tokens = (d: ClaudeDay) => d.input + d.output + d.cacheRead + d.cacheWrite;
+    const sum = { replies: 0, sessions: 0, tokens: 0, output: 0 };
+    for (const d of rows) {
+      sum.replies += d.replies;
+      sum.sessions += d.sessions;
+      sum.tokens += tokens(d);
+      sum.output += d.output;
+    }
+    const top = [...rows].sort((x, y) => tokens(y) - tokens(x))[0]?.model ?? "-";
+    for (const k of ["replies", "sessions", "tokens", "output"] as const) total[k] += sum[k];
+    log(`  ${day} ${fmt(sum.replies).padStart(8)} ${fmt(sum.sessions).padStart(8)} ${fmt(sum.tokens).padStart(16)} ${fmt(sum.output).padStart(12)}  ${top}`);
+  }
+  log(`  ${"total".padEnd(10)} ${fmt(total.replies).padStart(8)} ${fmt(total.sessions).padStart(8)} ${fmt(total.tokens).padStart(16)} ${fmt(total.output).padStart(12)}`);
+  log(`\n  ${n.files} files read in ${((Date.now() - started) / 1000).toFixed(1)}s${n.files > 0 && n.recognised === 0 ? " · no usage recognised: the log format may have changed" : ""}`);
+  if (!c) log("  this computer is not linked yet: npx @yaroslavhaidash/gitstats-cli@latest link --claude");
+  else if (!c.claude?.on) log("  counting: off · `gitstats claude on` sends these numbers with every sync");
+  else log(`  counting: on · synced through ${c.claude.syncedThrough ?? "never"}${c.claude.lastError ? ` · last error: ${c.claude.lastError}` : ""}`);
+}
+
 // ---------- server ----------
 
 async function post<T>(server: string, path: string, body: unknown, token?: string): Promise<{ status: number; body: T | null }> {
@@ -334,11 +635,11 @@ function summarize(reports: Counted[]): void {
   }
 }
 
-async function confirm(question: string): Promise<boolean> {
+async function confirm(question: string, yesByDefault = true): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = (await rl.question(`${question} [Y/n] `)).trim().toLowerCase();
+  const answer = (await rl.question(`${question} ${yesByDefault ? "[Y/n]" : "[y/N]"} `)).trim().toLowerCase();
   rl.close();
-  return answer === "" || answer === "y" || answer === "yes";
+  return answer === "" ? yesByDefault : answer === "y" || answer === "yes";
 }
 
 /**
@@ -395,25 +696,40 @@ function packHistory(reports: Counted[]): Counted[][] {
   return groups;
 }
 
-async function send(c: Config, reports: Counted[]): Promise<{ status: number; body: { repos: number; weeks: number; outdated?: boolean; minVersion?: string } | null }> {
+type IngestBody = { repos: number; weeks: number; outdated?: boolean; minVersion?: string; claude?: { days: number } | "rejected" };
+
+async function send(c: Config, reports: Counted[], claude: ClaudeUpload | null = null): Promise<{ status: number; body: IngestBody | null }> {
   const payload = reports.map(({ remoteHash, name, language, weeks, days, pending, since }) => ({ remoteHash, name, language, weeks, days, pending, ...(since ? { since } : {}) }));
-  return post(c.server, "/api/ingest", { cliVersion: runningVersion(), repos: payload }, c.token);
+  return post(c.server, "/api/ingest", { cliVersion: runningVersion(), repos: payload, ...(claude ? { claude } : {}) }, c.token);
 }
 
 /**
  * The first request carries the last-year repos, exactly as before 0.4.0. Full histories follow in
  * further requests, and a repo joins `historySent` only once its request returned 200, so a failed
  * one is counted and sent again next time. Re-sending a history replaces the same rows.
+ * Claude Code usage rides the first request; its window counts as sent only once the server says so.
  */
-async function upload(c: Config, reports: Counted[], nothingOld: string[] = []): Promise<{ repos: number; weeks: number; requests: number; history: number; historyLeft: number }> {
-  const { status, body } = await send(c, reports.filter((r) => !r.since));
+async function upload(c: Config, reports: Counted[], nothingOld: string[] = [], claude: ClaudeUpload | null = null): Promise<{ repos: number; weeks: number; requests: number; history: number; historyLeft: number; claudeDays: number | null }> {
+  const { status, body } = await send(c, reports.filter((r) => !r.since), claude);
   if (status !== 200 || !body) {
     c.lastSync = { at: new Date().toISOString(), repos: 0, weeks: 0, error: `server answered ${status}` };
     saveConfig(c);
     throw new Error(status === 401 ? "this computer is no longer linked; run `gitstats link` again" : `sync failed: HTTP ${status}`);
   }
   if (body.outdated) log(`this computer runs ${runningVersion()}; the board expects ${body.minVersion} or newer — run \`gitstats update\``);
-  const total = { repos: body.repos, weeks: body.weeks, requests: 1, history: 0, historyLeft: 0 };
+  let claudeDays: number | null = null;
+  if (claude && c.claude) {
+    if (isRecord(body.claude) && typeof body.claude.days === "number") {
+      claudeDays = body.claude.days;
+      c.claude.syncedThrough = claude.to;
+      c.claude.historySent = true;
+      delete c.claude.lastError;
+    } else {
+      c.claude.lastError = body.claude === "rejected" ? "claude: the server rejected the upload" : "claude: the server did not take the upload";
+      logFile(c.claude.lastError);
+    }
+  }
+  const total = { repos: body.repos, weeks: body.weeks, requests: 1, history: 0, historyLeft: 0, claudeDays };
   const groups = packHistory(reports.filter((r) => r.since));
   let error: string | undefined;
   for (const [i, group] of groups.entries()) {
@@ -444,16 +760,19 @@ async function sync(c: Config, quiet = false): Promise<void> {
   if (restarted !== null) process.exit(restarted);
   if (args.includes("--history")) {
     c.historySent = [];
+    if (c.claude) c.claude.historySent = false;
     saveConfig(c);
   }
   const since = new Date(Date.now() - DAYS * 86_400_000).toISOString().slice(0, 10);
   const { scanned, reports, nothingOld } = count(c, since, !args.includes("--no-fetch"), true, !quiet);
-  const body = await upload(c, reports, nothingOld);
+  const claude = await claudeUpload(c);
+  const body = await upload(c, reports, nothingOld, claude);
   if (!quiet) {
     const full = reports.filter((r) => r.since).length;
     log(`scanned ${scanned} repos, ${reports.length} with your commits${full > 0 ? ` (${full} counted in full, once)` : " in the last year"}, ${body.weeks} weekly rows sent in ${body.requests} request${body.requests === 1 ? "" : "s"}`);
     if (body.historyLeft > 0) log(`${body.historyLeft} full histories were not accepted (${c.lastSync?.error}); the next sync sends them again`);
     summarize(reports);
+    if (c.claude?.on) log(body.claudeDays !== null ? `Claude Code usage: ${body.claudeDays} day×model rows sent for ${claude?.from} to ${claude?.to}` : `Claude Code usage: not sent (${c.claude.lastError ?? "nothing counted"})`);
   }
 }
 
@@ -783,8 +1102,21 @@ async function link(): Promise<void> {
     log("  cancelled; nothing was uploaded and the link was removed locally (revoke it on the settings page).");
     return;
   }
-  const body = await upload(c, reports, nothingOld);
+  // Off unless asked: `--yes` alone never turns it on, so a scripted link sends what it always did.
+  const claudeDir = defaultClaudeDir();
+  if (existsSync(join(claudeDir, "projects"))) {
+    if (args.includes("--claude") || !args.includes("--yes")) explainClaude(claudeDir);
+    if (args.includes("--claude") || (!args.includes("--yes") && (await confirm("\n  Also count your Claude Code usage (tokens per day per model, numbers only)?", false)))) {
+      // A relink keeps the machine key's fallback id, so the history it re-sends replaces the same rows.
+      c.claude = { ...enableClaude(undefined, claudeDir), ...(previous?.claude?.fallbackId ? { fallbackId: previous.claude.fallbackId } : {}) };
+      saveConfig(c);
+      log("  counting Claude Code usage (every log Claude Code still keeps, this first time)…");
+    }
+  }
+  const claude = await claudeUpload(c);
+  const body = await upload(c, reports, nothingOld, claude);
   log(`  uploaded ${body.weeks} weekly rows for ${body.repos} repos in ${body.requests} request${body.requests === 1 ? "" : "s"}${body.historyLeft > 0 ? `; ${body.historyLeft} full histories were not accepted and go with the next sync` : ""}`);
+  if (c.claude?.on) log(body.claudeDays !== null ? `  Claude Code usage: ${body.claudeDays} day×model rows sent` : `  Claude Code usage: not sent (${c.claude.lastError ?? "nothing counted"}); the next sync tries again`);
   const how = installSchedule();
   log(`\n  scheduled: ${how}`);
   log(`  config: ${CONFIG}`);
@@ -858,7 +1190,32 @@ async function main(): Promise<void> {
       log(`server    ${c.server}\nuser      ${c.login}\nmachine   ${c.machine}\nversion   ${installedVersion()}\nroots     ${c.roots.join(", ")}\nextra     ${c.repos.join(", ") || "-"}\nemails    ${c.emails.join(", ")}`);
       log(`schedule  ${scheduleInstalled() ? "scheduled" : "paused \u00b7 `gitstats resume` starts it again"}`);
       log(c.lastSync ? `last sync ${c.lastSync.at} · ${c.lastSync.repos} repos · ${c.lastSync.weeks} weeks${c.lastSync.error ? ` · ERROR ${c.lastSync.error}` : ""}` : "last sync never");
+      log(`claude    ${c.claude?.on ? `on · synced through ${c.claude.syncedThrough ?? "never"}${c.claude.lastError ? ` · ERROR ${c.claude.lastError}` : ""}` : "off"}`);
       return;
+    }
+    case "claude": {
+      if (args[1] === "on") {
+        const c = requireConfig();
+        const dir = defaultClaudeDir();
+        if (!existsSync(join(dir, "projects"))) throw new Error(`no Claude Code logs in ${join(dir, "projects")}; set CLAUDE_CONFIG_DIR if they live elsewhere`);
+        explainClaude(dir);
+        if (!args.includes("--yes") && !(await confirm("\n  Send these numbers to your gitstats profile with every sync?", false))) {
+          log("  nothing changed");
+          return;
+        }
+        c.claude = enableClaude(c.claude, dir);
+        saveConfig(c);
+        log(`  Claude Code usage: on${c.claude.historySent ? "" : " · this first sync counts every log Claude Code still keeps"}`);
+        return sync(c);
+      }
+      if (args[1] === "off") {
+        const c = requireConfig();
+        if (c.claude) c.claude.on = false;
+        saveConfig(c);
+        log(`Claude Code usage: not sent any more. What was already sent stays on your page until you delete it on the settings page: ${c.server}/dashboard/settings`);
+        return;
+      }
+      return claudeStatus();
     }
     case "add": {
       const c = requireConfig();
@@ -926,7 +1283,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      log("usage: gitstats <link [--user <login>] [--root <dir>]... [--yes] | stats [--root <dir>]... [--fetch] | sync [--history] [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | pause | resume | update | unlink>");
+      log("usage: gitstats <link [--user <login>] [--root <dir>]... [--yes] [--claude] | stats [--root <dir>]... [--fetch] | sync [--history] [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | claude [on [--yes] | off] | pause | resume | update | unlink>");
   }
 }
 
