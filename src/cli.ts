@@ -6,7 +6,7 @@
  *   npx @yaroslavhaidash/gitstats-cli@latest link
  *                             pair this computer, scan for repos, sync, install a daily sync
  *                             (--user <login> refuses the pairing if the browser confirms as someone else;
- *                             --claude also counts Claude Code usage without asking)
+ *                             --no-claude leaves Claude Code usage off on this computer)
  *   gitstats sync             fetch each repo's default branch, recount the last year, upload (idempotent;
  *                             a repo seen for the first time is counted in full once; --history recounts
  *                             every repo in full; --no-fetch skips the fetch, --no-update skips the daily
@@ -18,7 +18,8 @@
  *   gitstats roots add <dir>  scan another folder (e.g. one outside your home directory)
  *   gitstats emails add <e>   attribute commits made with another email to you
  *   gitstats names on|off     also send repo names (off by default; your own page then labels private repos by hash)
- *   gitstats claude on|off    also send Claude Code usage: tokens per UTC day per model, numbers only (off by default)
+ *   gitstats claude on|off    send Claude Code usage: tokens per UTC day per model, numbers only (on by default;
+ *                             also off for every computer while the settings page has it off)
  *   gitstats claude           print the last 14 days of Claude Code usage from this machine's logs; sends nothing
  *   gitstats pause | resume   stop / restart the background sync without unlinking
  *   gitstats update           fetch the latest published version now (sync does this on its own, once a day)
@@ -73,7 +74,11 @@ type Config = {
   lastUpdateCheck?: string;
   /** Remote hashes whose full history this machine has uploaded. Never sent. */
   historySent?: string[];
-  /** Claude Code usage counting; absent or `on: false` sends nothing. Never sent itself. */
+  /**
+   * Claude Code usage counting. Absent means on by default: the first sync with Claude Code logs present
+   * turns it on. `on: false` is this computer's own `claude off` and the server never overrides it.
+   * Never sent itself.
+   */
   claude?: ClaudeConfig;
 };
 
@@ -87,6 +92,8 @@ type ClaudeConfig = {
   lastError?: string;
   /** Machine id for platforms where none can be read; kept so the machine key stays stable. */
   fallbackId?: string;
+  /** The settings page has counting off: the logs are not read until a sync's answer says it is on again. */
+  serverOff?: boolean;
 };
 
 type Week = { weekStart: string; additions: number; deletions: number; commits: number };
@@ -526,8 +533,15 @@ function claudeMachine(c: Config, cc: ClaudeConfig): string {
  * format change) is not sent at all rather than wiping counted days with zeros.
  */
 async function claudeUpload(c: Config): Promise<ClaudeUpload | null> {
+  if (!c.claude) {
+    // On by default: a computer that has Claude Code logs starts counting on its first sync after 0.6.0.
+    const dir = defaultClaudeDir();
+    if (!existsSync(join(dir, "projects"))) return null;
+    c.claude = enableClaude(undefined, dir);
+    saveConfig(c);
+  }
   const cc = c.claude;
-  if (!cc?.on) return null;
+  if (!cc.on || cc.serverOff) return null;
   const started = Date.now();
   const to = utcToday();
   const span = addDays(to, -CLAUDE_MAX_SPAN);
@@ -563,6 +577,7 @@ function enableClaude(prev: ClaudeConfig | undefined, dir: string): ClaudeConfig
     historySent: same ? prev.historySent : false,
     ...(same && prev.syncedThrough ? { syncedThrough: prev.syncedThrough } : {}),
     ...(prev?.fallbackId ? { fallbackId: prev.fallbackId } : {}),
+    ...(prev?.serverOff ? { serverOff: true } : {}),
   };
 }
 
@@ -602,8 +617,10 @@ async function claudeStatus(): Promise<void> {
   }
   log(`  ${"total".padEnd(10)} ${fmt(total.replies).padStart(8)} ${fmt(total.sessions).padStart(8)} ${fmt(total.tokens).padStart(16)} ${fmt(total.output).padStart(12)}`);
   log(`\n  ${n.files} files read in ${((Date.now() - started) / 1000).toFixed(1)}s${n.files > 0 && n.recognised === 0 ? " · no usage recognised: the log format may have changed" : ""}`);
-  if (!c) log("  this computer is not linked yet: npx @yaroslavhaidash/gitstats-cli@latest link --claude");
-  else if (!c.claude?.on) log("  counting: off · `gitstats claude on` sends these numbers with every sync");
+  if (!c) log("  this computer is not linked yet: npx @yaroslavhaidash/gitstats-cli@latest link");
+  else if (c.claude?.serverOff) log(`  counting: off on the settings page · ${c.server}/dashboard/settings#claude`);
+  else if (!c.claude) log("  counting: on from the next sync");
+  else if (!c.claude.on) log("  counting: off on this computer · `gitstats claude on` sends these numbers with every sync");
   else log(`  counting: on · synced through ${c.claude.syncedThrough ?? "never"}${c.claude.lastError ? ` · last error: ${c.claude.lastError}` : ""}`);
 }
 
@@ -696,7 +713,7 @@ function packHistory(reports: Counted[]): Counted[][] {
   return groups;
 }
 
-type IngestBody = { repos: number; weeks: number; outdated?: boolean; minVersion?: string; claude?: { days: number } | "rejected" };
+type IngestBody = { repos: number; weeks: number; outdated?: boolean; minVersion?: string; claude?: { days: number } | "rejected" | "off"; claudeCounting?: boolean };
 
 async function send(c: Config, reports: Counted[], claude: ClaudeUpload | null = null): Promise<{ status: number; body: IngestBody | null }> {
   const payload = reports.map(({ remoteHash, name, language, weeks, days, pending, since }) => ({ remoteHash, name, language, weeks, days, pending, ...(since ? { since } : {}) }));
@@ -718,7 +735,12 @@ async function upload(c: Config, reports: Counted[], nothingOld: string[] = [], 
   }
   if (body.outdated) log(`this computer runs ${runningVersion()}; the board expects ${body.minVersion} or newer — run \`gitstats update\``);
   let claudeDays: number | null = null;
-  if (claude && c.claude) {
+  // The settings page's switch, on every answer since 0.6.0; servers before it do not send the key.
+  if (c.claude && typeof body.claudeCounting === "boolean") {
+    if (body.claudeCounting) delete c.claude.serverOff;
+    else c.claude.serverOff = true;
+  }
+  if (claude && c.claude && body.claude !== "off") {
     if (isRecord(body.claude) && typeof body.claude.days === "number") {
       claudeDays = body.claude.days;
       c.claude.syncedThrough = claude.to;
@@ -772,8 +794,16 @@ async function sync(c: Config, quiet = false): Promise<void> {
     log(`scanned ${scanned} repos, ${reports.length} with your commits${full > 0 ? ` (${full} counted in full, once)` : " in the last year"}, ${body.weeks} weekly rows sent in ${body.requests} request${body.requests === 1 ? "" : "s"}`);
     if (body.historyLeft > 0) log(`${body.historyLeft} full histories were not accepted (${c.lastSync?.error}); the next sync sends them again`);
     summarize(reports);
-    if (c.claude?.on) log(body.claudeDays !== null ? `Claude Code usage: ${body.claudeDays} day×model rows sent for ${claude?.from} to ${claude?.to}` : `Claude Code usage: not sent (${c.claude.lastError ?? "nothing counted"})`);
+    if (c.claude?.on) log(claudeLine(c, body.claudeDays, claude));
   }
+}
+
+function claudeLine(c: Config, days: number | null, claude: ClaudeUpload | null): string {
+  if (c.claude?.serverOff) return `Claude Code usage: off on the settings page (${c.server}/dashboard/settings#claude)`;
+  if (days !== null) return `Claude Code usage: ${days} day×model rows sent for ${claude?.from} to ${claude?.to}`;
+  // Nothing was counted because the settings page had it off when this sync started; it answered on.
+  if (claude === null && !c.claude?.lastError) return "Claude Code usage: on again on the settings page, counted from the next sync";
+  return `Claude Code usage: not sent (${c.claude?.lastError ?? "nothing counted"})`;
 }
 
 // ---------- scheduler ----------
@@ -1102,21 +1132,22 @@ async function link(): Promise<void> {
     log("  cancelled; nothing was uploaded and the link was removed locally (revoke it on the settings page).");
     return;
   }
-  // Off unless asked: `--yes` alone never turns it on, so a scripted link sends what it always did.
+  // On by default; `--no-claude` (or `claude off` later) keeps it off on this computer.
   const claudeDir = defaultClaudeDir();
-  if (existsSync(join(claudeDir, "projects"))) {
-    if (args.includes("--claude") || !args.includes("--yes")) explainClaude(claudeDir);
-    if (args.includes("--claude") || (!args.includes("--yes") && (await confirm("\n  Also count your Claude Code usage (tokens per day per model, numbers only)?", false)))) {
-      // A relink keeps the machine key's fallback id, so the history it re-sends replaces the same rows.
-      c.claude = { ...enableClaude(undefined, claudeDir), ...(previous?.claude?.fallbackId ? { fallbackId: previous.claude.fallbackId } : {}) };
-      saveConfig(c);
-      log("  counting Claude Code usage (every log Claude Code still keeps, this first time)…");
-    }
+  if (args.includes("--no-claude")) {
+    c.claude = { ...enableClaude(undefined, claudeDir), on: false };
+    saveConfig(c);
+  } else if (existsSync(join(claudeDir, "projects"))) {
+    explainClaude(claudeDir);
+    // A relink keeps the machine key's fallback id, so the history it re-sends replaces the same rows.
+    c.claude = { ...enableClaude(undefined, claudeDir), ...(previous?.claude?.fallbackId ? { fallbackId: previous.claude.fallbackId } : {}) };
+    saveConfig(c);
+    log("  counting Claude Code usage too (every log Claude Code still keeps, this first time; off: gitstats claude off)…");
   }
   const claude = await claudeUpload(c);
   const body = await upload(c, reports, nothingOld, claude);
   log(`  uploaded ${body.weeks} weekly rows for ${body.repos} repos in ${body.requests} request${body.requests === 1 ? "" : "s"}${body.historyLeft > 0 ? `; ${body.historyLeft} full histories were not accepted and go with the next sync` : ""}`);
-  if (c.claude?.on) log(body.claudeDays !== null ? `  Claude Code usage: ${body.claudeDays} day×model rows sent` : `  Claude Code usage: not sent (${c.claude.lastError ?? "nothing counted"}); the next sync tries again`);
+  if (c.claude?.on) log(`  ${claudeLine(c, body.claudeDays, claude)}`);
   const how = installSchedule();
   log(`\n  scheduled: ${how}`);
   log(`  config: ${CONFIG}`);
@@ -1190,7 +1221,7 @@ async function main(): Promise<void> {
       log(`server    ${c.server}\nuser      ${c.login}\nmachine   ${c.machine}\nversion   ${installedVersion()}\nroots     ${c.roots.join(", ")}\nextra     ${c.repos.join(", ") || "-"}\nemails    ${c.emails.join(", ")}`);
       log(`schedule  ${scheduleInstalled() ? "scheduled" : "paused \u00b7 `gitstats resume` starts it again"}`);
       log(c.lastSync ? `last sync ${c.lastSync.at} · ${c.lastSync.repos} repos · ${c.lastSync.weeks} weeks${c.lastSync.error ? ` · ERROR ${c.lastSync.error}` : ""}` : "last sync never");
-      log(`claude    ${c.claude?.on ? `on · synced through ${c.claude.syncedThrough ?? "never"}${c.claude.lastError ? ` · ERROR ${c.claude.lastError}` : ""}` : "off"}`);
+      log(`claude    ${c.claude?.serverOff ? "off on the settings page" : !c.claude ? "on from the next sync" : c.claude.on ? `on · synced through ${c.claude.syncedThrough ?? "never"}${c.claude.lastError ? ` · ERROR ${c.claude.lastError}` : ""}` : "off"}`);
       return;
     }
     case "claude": {
@@ -1283,7 +1314,7 @@ async function main(): Promise<void> {
       return;
     }
     default:
-      log("usage: gitstats <link [--user <login>] [--root <dir>]... [--yes] [--claude] | stats [--root <dir>]... [--fetch] | sync [--history] [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | claude [on [--yes] | off] | pause | resume | update | unlink>");
+      log("usage: gitstats <link [--user <login>] [--root <dir>]... [--yes] [--no-claude] | stats [--root <dir>]... [--fetch] | sync [--history] [--no-fetch] [--no-update] | status | add <path> | roots add <dir> | emails add <email> | names on|off | claude [on [--yes] | off] | pause | resume | update | unlink>");
   }
 }
 
